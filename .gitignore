@@ -30,3 +30,6 @@ __pycache__/
 # GitHub Actions 模板保存在 ci/ 下（当前令牌无 workflow 权限，无法直接推 .github/workflows/）。
 # 启用 CI 时把 ci/*.yml 复制到 .github/workflows/ 再提交，详见 ci/README.md。
 /.github/workflows/
+
+# 本地打包产物（GitHub Release 由 ci/release.yml 或手动上传）
+/dist/
