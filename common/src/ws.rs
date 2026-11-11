@@ -198,13 +198,19 @@ where
     let mut stream = stream;
     let key = random_key();
 
+    // `Origin` 不是可选项：官方 Go 版 frps 用 `golang.org/x/net/websocket`
+    // 做服务端，它的默认握手会校验 Origin —— **请求里没有该头就回 403
+    // "null origin"**，而且响应体是空的，日志里只能看到一个干巴巴的
+    // `403 Forbidden`，极难判断是这里缺头。官方 Go frpc 是自己发的
+    // （`Origin: http://<host>`），我们照抄即可。
     let mut req = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {key}\r\n\
-         Sec-WebSocket-Version: 13\r\n"
+         Sec-WebSocket-Version: 13\r\n\
+         Origin: http://{host}\r\n"
     );
     for (k, v) in extra {
         req.push_str(&format!("{k}: {v}\r\n"));
@@ -237,10 +243,13 @@ where
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     if code != 101 {
-        return Err(WsError::Handshake(format!(
-            "服务端返回 {code}（期望 101）：{}",
-            head.lines().next().unwrap_or("")
-        )));
+        let line = head.lines().next().unwrap_or("");
+        let hint = hint_for_status(code, &head);
+        return Err(WsError::Handshake(if hint.is_empty() {
+            format!("服务端返回 {code}（期望 101）：{line}")
+        } else {
+            format!("服务端返回 {code}（期望 101）：{line}\n  ↳ {hint}")
+        }));
     }
     let want = accept_key(&key);
     let got = header_value(&head, "sec-websocket-accept").unwrap_or_default();
@@ -252,6 +261,49 @@ where
 
     let leftover = buf[head_end..].to_vec();
     Ok(WsStream::new(stream, true, leftover))
+}
+
+/// 握手被非 101 拒绝时，按状态码给一句**能直接动手**的处置建议。
+///
+/// 这些码全是"中间那一层"（CDN / WAF / 反代）回的，不是 frp 回的；
+/// 光报 `403` / `520` 用户根本不知道该改哪。实测案例：
+///
+/// * 阿里云 ESA 在 `bindPort` 前面时，`GET /~!frp` 被 WAF 判为可疑路径 → **403**
+/// * 路径换成 `/ws` 后 WAF 放行，但 CDN 回源失败 → **520 Origin Error**
+///
+/// 两种现象、两处不同改法，靠状态码 + `Server` 头就能区分开。
+fn hint_for_status(code: u16, head: &str) -> &'static str {
+    let server = header_value(head, "server").unwrap_or_default();
+    let via_gateway = ["esa", "cloudflare", "awselb", "tengine", "nginx", "envoy"]
+        .iter()
+        .any(|s| server.to_ascii_lowercase().contains(s));
+
+    match code {
+        403 => {
+            if via_gateway {
+                "被中间网关（CDN / WAF）拒绝，与 frp 本身无关。\
+                 **最常见原因是握手请求少了 `Origin` 头** —— 阿里云 ESA 这类网关\
+                 对没有 Origin 的 WebSocket 升级一律 403，而官方 Go frpc 恰好\
+                 总会带上它，所以同一条链路它通、我们不通（v0.8.1 已内置该头）。\
+                 若仍在 403，再考虑路径被判可疑：WAF 可能拦默认的 `/~!frp`，\
+                 此时改成普通路径 `[transport] websocket.path = \"/ws\"`\
+                 并让服务端同步（本项目 frps 认任意路径；官方 frps 需打补丁）。"
+            } else {
+                "服务端拒绝握手：检查 `auth.token`，以及服务端是否限制了来源 IP。"
+            }
+        }
+        404 => "路径对不上：客户端 `websocket.path` 必须与服务端/反代配置一致。",
+        502 | 520 | 521 | 522 | 523 | 524 => {
+            "CDN **回源失败**（拿到的是 CDN 的边缘错误页，请求没到 frps）。\
+             依次确认：① 源站 frps 正在运行且端口与 CDN 回源端口一致；\
+             ② 源站跑的是 v0.8.1+（旧版收到 `GET /` 不回 HTTP，CDN 会判源站不健康）；\
+             ③ CDN 回源协议与源站端口匹配（源站是明文就选 HTTP，是 TLS 就选 HTTPS）；\
+             ④ 源站防火墙放行 CDN 回源网段。"
+        }
+        400 => "反代改写了握手请求（常见于 Nginx 未透传 `Upgrade` / `Connection`）。",
+        426 => "对端要求 `Upgrade: websocket`，说明请求被降级成了普通 HTTP。",
+        _ => "",
+    }
 }
 
 /// 服务端拒绝握手时回一个正经的 HTTP 错误，而不是直接断连 ——
@@ -685,6 +737,28 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
 
+    /// 握手被中间网关拒绝时，提示必须**区分 403 与 520** ——
+    /// 一个是"换路径"，一个是"修源站"，照着做反了会白折腾。
+    #[test]
+    fn 状态码提示要能区分_cdn_的两种失败() {
+        let esa_403 = "HTTP/1.1 403 Forbidden\r\nServer: ESA\r\n\r\n";
+        let h = hint_for_status(403, esa_403);
+        // 首要原因是缺 Origin（实测结论），路径只是次要怀疑对象。
+        assert!(h.contains("Origin"), "403 必须先提示缺 Origin：{h}");
+        assert!(h.contains("websocket.path"), "403 还应给出换路径的兜底：{h}");
+
+        let esa_520 = "HTTP/1.1 520 Origin Error\r\nServer: ESA\r\n\r\n";
+        let h = hint_for_status(520, esa_520);
+        assert!(h.contains("回源"), "520 应指向回源失败：{h}");
+        assert!(h.contains("源站"), "520 应提示检查源站：{h}");
+
+        // 非网关的 403（对端就是 frps/nginx）不该甩锅给 CDN。
+        let plain = "HTTP/1.1 403 Forbidden\r\nServer: nfrp\r\n\r\n";
+        assert!(hint_for_status(403, plain).contains("auth.token"));
+
+        assert_eq!(hint_for_status(418, "HTTP/1.1 418 I'm a teapot\r\n\r\n"), "");
+    }
+
     /// RFC 6455 的官方向量：key 固定时 Accept 必须等于这个值。
     ///
     /// 这一条是所有浏览器/网关的硬校验，算错就是"连不上且没有可读的错误"。
@@ -717,6 +791,71 @@ mod tests {
         let n = ws.read(&mut back).await.unwrap();
         assert_eq!(&back[..n], b"hello-ws");
         assert_eq!(server.await.unwrap(), b"hello-ws");
+    }
+
+    /// ★ v0.8.1 的核心修复：握手请求**必须带 `Origin` 头**。
+    ///
+    /// # 为什么值得一条专门用例
+    ///
+    /// 实测（阿里云 ESA，WAF 规则全部放行）：同一条链路、同一个路径
+    ///
+    /// ```text
+    /// GET /~!frp  无 Origin  → 403 Forbidden   (Server: ESA)
+    /// GET /~!frp  +Origin    → 101 Switching Protocols
+    /// ```
+    ///
+    /// 也就是说云 WAF 拦的是「带 `Upgrade: websocket` 却不带 `Origin`」的请求，
+    /// 而不是路径。官方 Go frpc 底层 `x/net/websocket` 的 `Dial()` 天然会写
+    /// `Origin: http://<host>`，于是出现最容易被误判的现象：
+    /// **Go 版 frpc 通、我们 403**，两边日志都看不出原因。
+    ///
+    /// 这里直接抓握手的原始字节断言，避免以后重构请求头时又把它丢掉。
+    #[tokio::test]
+    async fn 握手请求必须带_origin_头() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut b = b;
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 512];
+            // 读到请求头结束
+            loop {
+                let n = b.read(&mut chunk).await.unwrap();
+                assert_ne!(n, 0, "客户端没发完请求头就断开");
+                raw.extend_from_slice(&chunk[..n]);
+                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let req = String::from_utf8_lossy(&raw).to_string();
+            // 回 101，Accept 按客户端给的 key 现算，保证走完正常校验
+            let key = header_value(&req, "sec-websocket-key").expect("请求里必须有 key");
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {}\r\n\r\n",
+                accept_key(key.trim())
+            );
+            b.write_all(resp.as_bytes()).await.unwrap();
+            b.flush().await.unwrap();
+            req
+        });
+
+        connect(a, "frps.example.com", FRP_WS_PATH, &[])
+            .await
+            .expect("握手应成功");
+        let req = server.await.unwrap();
+
+        assert!(
+            req.to_ascii_lowercase().contains("origin:"),
+            "握手请求缺 Origin 头，云 WAF 会直接 403。实际请求：\n{req}"
+        );
+        // 值必须与 Host 一致：部分网关会校验 Origin 与 Host 同源。
+        assert!(
+            req.contains("Origin: http://frps.example.com"),
+            "Origin 必须与 Host 同源。实际请求：\n{req}"
+        );
+        assert!(req.contains("Host: frps.example.com"), "Host 头不对：\n{req}");
     }
 
     /// 掩码规则：客户端发的帧必须带掩码，服务端发的必须不带。

@@ -55,6 +55,11 @@ pub struct ClientInfo {
     pub run_id: String,
     pub client_id: String,
     pub user: String,
+    /// 控制连接的对端地址（★ v0.8.1）。
+    ///
+    /// 放在 `trusted_proxies` 白名单命中时会是 `X-Forwarded-For` 里的真实地址
+    /// （CDN / 反代后面才拿得到真实客户端 IP）。
+    pub client_ip: std::net::IpAddr,
     pub proxies: Vec<String>,
     /// 正在排队等工作连接的用户连接数。
     pub backlog: usize,
@@ -638,6 +643,7 @@ impl Registry {
                 run_id: c.run_id(),
                 client_id: c.client_id.clone(),
                 user: c.user.clone(),
+                client_ip: c.peer_ip(),
                 proxies: c.proxy_names(),
                 backlog: c.backlog(),
                 idle_work_conns: c.idle_work_conns(),

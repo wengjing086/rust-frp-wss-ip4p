@@ -20,37 +20,44 @@ TCP 首字节 = 0x16 → TLS 监听（frp over TLS）
 
 ## 本项目的实现
 
-改动集中在 `server/src/serve.rs` 的 `handle_conn()`，引入 `probe_ws()`
-做两级嗅探：
+改动集中在 `server/src/serve.rs` 的 `handle_conn()`，引入 `probe_http()`
+做两级嗅探（0.8.1 起，原来只比对固定前缀的 `probe_ws()` 已替换）：
 
 ```text
-                       ┌─ 'G' ──► probe_ws()（TLS 之前）
-TCP 读 1 字节 ─────────┤            │ 命中 → ws::accept() → 明文 WebSocket
-                       │            └ 未命中 → TLS 协商 → 普通 frp
-                       │
-                       └─ 其他 ─► tls::accept_server()
+                        ┌─ 是 HTTP 升级请求 ──► ws::accept() → 明文 WebSocket
+TCP 读 1 字节 ─────────┤   是普通 HTTP 请求 ──► 回 200/404 后关闭（★ CDN 健康检查）
+                        │   都不是 ───────────► 回放字节 → 继续下面的 TLS 分流
+                        └───────────┐
+                                    ▼
+                              tls::accept_server()
                                     │ 0x17 frp 自定义首字节 → TLS
                                     │ 0x16 标准 ClientHello  → TLS
                                     │ 其他                    → 明文透传
                                     ▼
-                              ★ probe_ws()（TLS 解密之后）
-                                    │ 命中 → ws::accept() → WSS
-                                    └ 未命中 → PrefixedStream 回放 → 原版 frp
+                              ★ 再判一次 HTTP（解密后的流）
+                                    │ 升级请求 → ws::accept() → WSS
+                                    └ 其他     → PrefixedStream 回放 → 原版 frp
 ```
 
 关键点：
 
-1. **字节零丢失**。`probe_ws()` 逐字节比对 `GET /~!frp`，一旦不匹配立即停止，
-   所有读过的字节都用 `PrefixedStream` 塞回流的最前面。非 WebSocket 客户端
-   只多读 1 个字节，行为与改造前一致。
-2. **探测有时限**。明文路径用 `PROBE_TIMEOUT`（10s，与原版一致）；
+1. **路径不设限**。判定的是"是不是一条合法的 WebSocket 升级请求"
+   （`GET /xxx HTTP/1.1` + `Upgrade: websocket`），不是"路径等不等于 `/~!frp`"。
+   安全边界由 token 认证把守，不靠路径保密。这样放在 CDN / WAF 后面时，
+   客户端可以把路径改成 `/ws` 绕开对 `~!` 的拦截（见 [CDN.md](CDN.md)）。
+2. **普通 HTTP 会得到响应**。CDN 回源健康检查 `GET /` 拿到 `200 ok`，
+   浏览器误访问拿到 `404`，都不会再出现"连上就断、CDN 判源站 520"。
+3. **字节零丢失**。判 HTTP 只读到 `\r\n\r\n`（上限 16 KiB），不匹配就用
+   `PrefixedStream` 全部塞回流的最前面。非 HTTP 客户端最多多读 4 个字节，
+   行为与改造前一致。
+4. **探测有时限**。明文路径用 `PROBE_TIMEOUT`（10s，与原版一致）；
    TLS 内的二次探测用 `WSS_PROBE_TIMEOUT`（3s），避免解密后首字节恰好是
-   `G`、而客户端首包又很短时被拖住。超时只判定为「非 WebSocket」，不丢数据。
-3. **客户端发标准 TLS ClientHello**。官方 frpc 的 `wss` 分支不挂
+   `G`、而客户端首包又很短时被拖住。超时只判定为「非 HTTP」，不丢数据。
+5. **客户端发标准 TLS ClientHello**。官方 frpc 的 `wss` 分支不挂
    `DialHookCustomTLSFirstByte`，所以本项目客户端在 `wss` 时强制关闭 frp
    自定义首字节 `0x17`，改发 `0x16` —— 这样也能连打了补丁的官方 frps 或 nginx。
    服务端两种首字节都收，互不冲突。
-4. **零配置**。`frps.toml` 不需要任何 WSS 相关项；`frpc.toml` 只用官方已有的
+6. **零配置**。`frps.toml` 不需要任何 WSS 相关项；`frpc.toml` 只用官方已有的
    `transport.protocol = "wss"`。
 
 ## 使用

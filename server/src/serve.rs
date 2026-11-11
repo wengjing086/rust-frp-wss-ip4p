@@ -185,20 +185,59 @@ static CONN_END_LOG: nfrp_common::util::FoldedLog = nfrp_common::util::FoldedLog
 /// 本服务端在 [`handle_conn`] 里做**两级嗅探**：
 ///
 /// ```text
-/// TCP 首字节 == 'G'  ──► 明文 WebSocket 升级（官方路径）
-///         │ 否
-///         ▼
+/// TCP 首字节  ──► 是不是一条 HTTP 请求？（方法前缀 + `HTTP/1.x` 请求行）
+///    │                  │ 是，且带 `Upgrade: websocket`
+///    │                  ├──► 明文 WebSocket 升级（路径不限）
+///    │                  │ 是，但不是升级请求（CDN 回源健康检查 / 浏览器误访问）
+///    │                  └──► 回一个最小 HTTP 响应再关（★ v0.8.1）
+///    │ 否
+///    ▼
 ///   TLS 协商（0x16 标准 / 0x17 frp 自定义首字节 / 明文透传）
 ///         ▼
-///   ★ 在解密后的流上再嗅探 `GET /~!frp` ──► WSS 升级（本补丁新增）
+///   ★ 在解密后的流上**再判一次 HTTP** ──► WSS 升级（本项目新增）
 ///         │ 否
 ///         ▼
-///   字节无损回放 ──► 原版 frp over TLS（兼容默认 tcp/tls 客户端）
+///   字节无损回放 ──► 原版 frp over TCP / over TLS（兼容默认 tcp/tls 客户端）
 /// ```
 ///
 /// 两条路径最终都汇入同一套 yamux + frp 控制流程，**frps.toml 不需要任何
 /// WSS 相关配置**，官方 frpc / 第三方 frp 客户端也不用改。
-const WS_PREFIX: &[u8] = b"GET /~!frp";
+///
+/// # ★ v0.8.1：为什么不比对固定路径 `GET /~!frp`
+///
+/// 老实现只认 `GET /~!frp` 这 11 个字节。放在 CDN / WAF 后面时这会两头卡：
+///
+/// 1. 客户端要改路径绕开 WAF（`~!` 这种路径很容易被当成扫描流量直接 403），
+///    一改服务端就认不出；
+/// 2. CDN 回源健康检查发的是 `GET /`，老实现把它当"非 WS"丢给 TLS 协商，
+///    协商失败直接断连 ⇒ CDN 判定源站不健康，回 520 / 403。
+///
+/// 现在改判"**是不是一条合法的 WebSocket 升级请求**"：路径随便配
+/// （`/ws`、`/api/v1/stream` 都行），安全边界仍然由 token 认证把守，
+/// 不靠路径保密。
+const MAX_HTTP_HEAD: usize = 16 * 1024;
+
+/// 常见 HTTP 方法前缀（只取前 4 字节，够区分"像不像 HTTP"）。
+///
+/// 裸 frp 连接的头部是 4 字节大端长度，撞上这几种 ASCII 的概率可以忽略；
+/// 真撞上了也只是多读一个请求头然后原样回放，不会丢数据。
+const HTTP_METHOD_PREFIXES: [&[u8]; 9] = [
+    b"GET ", b"POST", b"PUT ", b"HEAD", b"OPTI", b"DELE", b"CONN", b"TRAC", b"PATC",
+];
+
+/// 一轮 HTTP 判定的结论。
+enum Detected {
+    /// 是 WebSocket 升级请求；`forwarded_for` 是 `X-Forwarded-For` 里声明的
+    /// 原始客户端地址（采信与否见 [`apply_forwarded_for`]）。
+    Ws {
+        /// 反代 / CDN 声明的真实客户端 IP。
+        forwarded_for: Option<std::net::IpAddr>,
+    },
+    /// 普通 HTTP 请求：**已经回过响应**，调用方直接收工。
+    Plain,
+    /// 不是 HTTP：读到的字节已全部回放，继续按 frp 协议处理。
+    NotHttp,
+}
 
 /// 由 [`ServerConfig`] 里的上限字段折算出来的结构体。
 pub fn limits_from(cfg: &ServerConfig) -> ServerLimits {
@@ -331,6 +370,16 @@ pub async fn serve_on_with(
     extras: ServeExtras,
 ) -> Result<()> {
     let addr = listener.local_addr().context("取不到监听地址")?;
+
+    // ★ v0.8.1：IP 归属地查询器。放在这里而不是 `main`，是为了让
+    // "用库起一个 frps"（集成测试 / 自己写的宿主程序）也拿到同样的行为。
+    // 重复调用以第一次为准 —— 热重载换配置不会把已经攒下的缓存丢掉。
+    {
+        let geo = nfrp_common::ipgeo::init(cfg.ipgeo, None);
+        if geo.enabled() {
+            debug!("客户端 IP 归属地查询已开启（ipgeo_cache.json，可用 ipgeo = false 关闭）");
+        }
+    }
 
     // 限制①批次3：自定义证书 / mTLS。必须在任何 accept_server 之前安装。
     frp::tls::configure_server_tls(
@@ -917,48 +966,156 @@ fn load_not_found_page(path: &str) -> Option<Arc<Vec<u8>>> {
 // 连接分发
 // ---------------------------------------------------------------------------
 
-/// 在一条流上探测 [`WS_PREFIX`]，把**所有读过的字节原样回放**。
+/// 在一条流上判定：HTTP？WebSocket 升级？都不是？
 ///
-/// 逐字节比对，一旦不匹配立刻停止：普通 frp 连接只多读 1 个字节，代价可忽略。
-/// `head` 是调用方已经读走、但属于协议数据的字节（例如 TCP 层那个首字节）。
+/// 读过的字节**一律回放**（[`PrefixedStream`]），所以这个函数对
+/// "不是 HTTP" 的连接是零破坏的 —— 最坏情况是白等一个请求头。
 ///
-/// 返回 `(是否命中, 可继续读写的流)`。命中时流里仍带着完整请求行，
-/// 交给 [`ws::accept`] 从第一个字节开始读即可。
-async fn probe_ws(
+/// `head` 是调用方已经读走、但属于协议数据的字节（TCP 层那个首字节）。
+async fn probe_http(
     mut stream: BoxStream,
-    head: Vec<u8>,
+    mut head: Vec<u8>,
     timeout: Duration,
-) -> Result<(bool, BoxStream)> {
-    let mut head = head;
-    // 调用方已经读到的部分若已不匹配，无需再碰网络。
-    if head
+) -> Result<(Detected, BoxStream)> {
+    // 第一步：凑够 4 字节，判断"像不像 HTTP 方法名"。
+    // 裸 frp 连接只多读 3 个字节，代价可忽略。
+    while head.len() < 4 {
+        match read_byte(&mut stream, timeout).await? {
+            Some(b) => head.push(b),
+            None => {
+                return Ok((
+                    Detected::NotHttp,
+                    Box::pin(PrefixedStream::new(head, stream)),
+                ))
+            }
+        }
+    }
+    if !looks_like_http(&head[..4]) {
+        return Ok((
+            Detected::NotHttp,
+            Box::pin(PrefixedStream::new(head, stream)),
+        ));
+    }
+
+    // 第二步：读到 `\r\n\r\n` 为止（上限 16 KiB，防"不发空行"的慢速攻击）。
+    loop {
+        if let Some(end) = find_head_end(&head) {
+            head.truncate(end);
+            break;
+        }
+        if head.len() > MAX_HTTP_HEAD {
+            warn!("HTTP 请求头超过 {MAX_HTTP_HEAD} 字节，按非 WebSocket 处理");
+            return Ok((
+                Detected::NotHttp,
+                Box::pin(PrefixedStream::new(head, stream)),
+            ));
+        }
+        match read_byte(&mut stream, timeout).await? {
+            Some(b) => head.push(b),
+            None => {
+                // 头没读完就断了/超时：可能是裸 frp 恰好以 "GET " 开头，
+                // 字节回放，让下游按 frp 协议去解释。
+                return Ok((
+                    Detected::NotHttp,
+                    Box::pin(PrefixedStream::new(head, stream)),
+                ));
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&head).to_string();
+    let first_line = text.lines().next().unwrap_or("").trim_end();
+
+    // 请求行必须是 `METHOD SP PATH SP HTTP/1.x`，否则不认（避免把
+    // 恰好以 "GET " 开头的二进制流误判成 HTTP）。
+    if !first_line.contains(" HTTP/1.") {
+        return Ok((
+            Detected::NotHttp,
+            Box::pin(PrefixedStream::new(head, stream)),
+        ));
+    }
+
+    let is_upgrade = header_value(&text, "upgrade")
+        .map(|v| v.trim().eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+
+    if !is_upgrade {
+        // 普通 HTTP 请求。**CDN 回源健康检查走的就是这一支** ——
+        // 回一个正常的 200，CDN 才会把源站标记为健康。
+        let mut parts = first_line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("/");
+        let healthy = path == "/"
+            || path.starts_with("/health")
+            || path.starts_with("/healthz")
+            || path.starts_with("/status");
+        let (code, reason, body) = if healthy {
+            (200u16, "OK", "ok\n")
+        } else {
+            (404u16, "Not Found", "not found\n")
+        };
+        let send_body = !method.eq_ignore_ascii_case("HEAD");
+        let resp = format!(
+            "HTTP/1.1 {code} {reason}\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{}",
+            body.len(),
+            if send_body { body } else { "" }
+        );
+        debug!(%method, %path, code, "控制端口收到普通 HTTP 请求，已回最小响应");
+        let mut s: BoxStream = Box::pin(stream);
+        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut s, resp.as_bytes()).await {
+            debug!(error = %e, "回写 HTTP 响应失败（对端已断开）");
+        }
+        let _ = tokio::io::AsyncWriteExt::flush(&mut s).await;
+        // ★ 必须走一次 `shutdown`：TLS 回源时它会发 close_notify。
+        //   少这一步，CDN（和任何严格的 TLS 客户端）看到的是
+        //   "UnexpectedEof / 连接被重置"，健康检查照样判失败。
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut s).await;
+        return Ok((Detected::Plain, s));
+    }
+
+    let forwarded_for = header_value(&text, "x-forwarded-for")
+        .and_then(|v| v.split(',').next().map(|s| s.trim().to_string()))
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+
+    Ok((
+        Detected::Ws { forwarded_for },
+        Box::pin(PrefixedStream::new(head, stream)),
+    ))
+}
+
+/// 读 1 个字节；超时或 EOF 返回 `Ok(None)`（超时**不算错误**，由调用方决定语义）。
+async fn read_byte(stream: &mut BoxStream, timeout: Duration) -> Result<Option<u8>> {
+    let mut b = [0u8; 1];
+    match tokio::time::timeout(timeout, tokio::io::AsyncReadExt::read(stream, &mut b)).await {
+        Ok(Ok(0)) => Ok(None),
+        Ok(Ok(_)) => Ok(Some(b[0])),
+        Ok(Err(e)) => Err(e).context("读取 HTTP 探测字节失败"),
+        Err(_) => Ok(None),
+    }
+}
+
+/// 前 4 个字节是否像某个 HTTP 方法。
+fn looks_like_http(head: &[u8]) -> bool {
+    HTTP_METHOD_PREFIXES
         .iter()
-        .zip(WS_PREFIX.iter())
-        .any(|(got, want)| got != want)
-    {
-        return Ok((false, Box::pin(PrefixedStream::new(head, stream))));
-    }
-    while head.len() < WS_PREFIX.len() {
-        let mut b = [0u8; 1];
-        let n =
-            match tokio::time::timeout(timeout, tokio::io::AsyncReadExt::read(&mut stream, &mut b))
-                .await
-            {
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => return Err(e).context("读取 WebSocket 请求行失败"),
-                Err(_) => break, // 探测超时：按普通连接处理，由上层握手逻辑决定生死
-            };
-        if n == 0 {
-            break;
-        }
-        let want = WS_PREFIX[head.len()];
-        head.push(b[0]);
-        if b[0] != want {
-            break;
-        }
-    }
-    let matched = head == WS_PREFIX;
-    Ok((matched, Box::pin(PrefixedStream::new(head, stream))))
+        .any(|m| head.len() >= m.len() && &head[..m.len()] == *m)
+}
+
+/// 找 `\r\n\r\n`，返回**其后的位置**（也就是请求头长度）。
+fn find_head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// 取某个 header 的值（大小写不敏感，取第一份）。
+fn header_value(head: &str, name: &str) -> Option<String> {
+    let want = name.to_ascii_lowercase();
+    head.lines().skip(1).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        (k.trim().to_ascii_lowercase() == want).then(|| v.trim().to_string())
+    })
 }
 
 async fn handle_conn(
@@ -967,9 +1124,9 @@ async fn handle_conn(
     cfg: Arc<ServerConfig>,
     registry: Arc<Registry>,
 ) -> Result<()> {
-    // 第零层：只先读 1 个字节。明文 WebSocket 必须在 **TLS 之前**判，
-    // 理由见 [`WS_PREFIX`]；非 WebSocket 的客户端只多付一次"首字节到达"的
-    // 等待，与改造前等价（下面 `tls::accept_server` 本来也要做同样的探测）。
+    // 第零层：只先读 1 个字节。明文 WebSocket / CDN 回源健康检查都必须在
+    // **TLS 之前**判（它们都是明文 HTTP），其余客户端只多付一次"首字节到达"
+    // 的等待，与改造前等价（下面 `tls::accept_server` 本来也要做同样的探测）。
     let mut first = [0u8; 1];
     match tokio::time::timeout(
         PROBE_TIMEOUT,
@@ -986,10 +1143,14 @@ async fn handle_conn(
         }
     }
 
-    if first[0] == WS_PREFIX[0] {
-        // 明文 `protocol = "websocket"`：官方路径，服务端零配置。
-        let (is_ws, stream) = probe_ws(Box::pin(stream), vec![first[0]], PROBE_TIMEOUT).await?;
-        if is_ws {
+    // 第一层：HTTP 判定（明文 WS / 明文 HTTP / 都不是）。
+    //
+    // ★ v0.8.1：不再比对固定路径 `GET /~!frp`，见 [`Detected`] 的说明。
+    let (detected, stream) = probe_http(Box::pin(stream), vec![first[0]], PROBE_TIMEOUT).await?;
+    let peer = apply_forwarded_for(peer, &detected, &cfg);
+    match detected {
+        Detected::Ws { .. } => {
+            // 明文 `protocol = "websocket"`：官方路径，服务端零配置。
             let ws = ws::accept(stream)
                 .await
                 .context("WebSocket 升级失败（关闭连接）")?;
@@ -1010,38 +1171,92 @@ async fn handle_conn(
                 .context("WebSocket 内层 TLS 协商失败")?;
             return handle_stream(stream, peer, cfg, registry, false).await;
         }
-        // 前缀不匹配：字节已全部回放，按普通连接继续（保持原版行为）。
-        let stream = frp::tls::accept_server(stream, true, cfg.tls_force)
-            .await
-            .context("TLS 协商失败")?;
-        return handle_stream(stream, peer, cfg, registry, false).await;
+        // CDN 回源健康检查 / 浏览器误访问：响应已经回过去了，收工。
+        Detected::Plain => return Ok(()),
+        Detected::NotHttp => {}
     }
 
-    // 第一层：TLS。靠首字节自动识别（0x17 = frp 自定义首字节，0x16 = 标准 TLS，
-    // 其他 = 明文透传）。
-    let stream: BoxStream = Box::pin(PrefixedStream::new(vec![first[0]], stream));
+    // 第二层：TLS。靠首字节自动识别（0x17 = frp 自定义首字节，0x16 = 标准 TLS，
+    // 其他 = 明文透传）。`probe_http` 已把读过的字节无损回放。
     let stream = frp::tls::accept_server(stream, true, cfg.tls_force)
         .await
         .context("TLS 协商失败")?;
 
-    // ★★ 第二层（本项目新增）：在 **TLS 解密之后** 的流上再嗅探一次。
-    //    这正是 `transport.protocol = "wss"` 能在 bindPort 上直连的原因。
+    // ★★ 第三层（本项目新增）：在 **TLS 解密之后** 的流上再判一次 HTTP。
+    //    这正是 `transport.protocol = "wss"` 能在 bindPort 上直连的原因；
+    //    同时也是 **HTTPS 回源的 CDN** 能做健康检查、能升级 WSS 的原因。
     //    未命中的字节全部回放，原版 `frp over TLS` / 明文客户端完全不受影响。
-    let (is_ws, stream) = probe_ws(stream, Vec::new(), WSS_PROBE_TIMEOUT).await?;
-    if is_ws {
-        let ws = ws::accept(stream)
-            .await
-            .context("WSS 升级失败（关闭连接）")?;
-        info!(%peer, "WSS（TLS 内 WebSocket）控制连接已建立");
-        // 同明文 WS 分支：官方客户端在 WSS 里**不再**套第二层 TLS（外层已经是
-        // TLS 了），但 `accept_server` 对非 TLS 首字节原样回放，所以这一层
-        // 对 wss 是无损的 —— 它只是让"wss 之外还想再套一层"的客户端也能用。
-        let stream = frp::tls::accept_server(Box::pin(ws), true, false)
-            .await
-            .context("WSS 内层 TLS 协商失败")?;
-        return handle_stream(stream, peer, cfg, registry, false).await;
+    let (detected, stream) = probe_http(stream, Vec::new(), WSS_PROBE_TIMEOUT).await?;
+    let peer = apply_forwarded_for(peer, &detected, &cfg);
+    match detected {
+        Detected::Ws { .. } => {
+            let ws = ws::accept(stream)
+                .await
+                .context("WSS 升级失败（关闭连接）")?;
+            info!(%peer, "WSS（TLS 内 WebSocket）控制连接已建立");
+            // 同明文 WS 分支：官方客户端在 WSS 里**不再**套第二层 TLS（外层已经是
+            // TLS 了），但 `accept_server` 对非 TLS 首字节原样回放，所以这一层
+            // 对 wss 是无损的 —— 它只是让"wss 之外还想再套一层"的客户端也能用。
+            let stream = frp::tls::accept_server(Box::pin(ws), true, false)
+                .await
+                .context("WSS 内层 TLS 协商失败")?;
+            handle_stream(stream, peer, cfg, registry, false).await
+        }
+        Detected::Plain => Ok(()),
+        Detected::NotHttp => handle_stream(stream, peer, cfg, registry, false).await,
     }
-    handle_stream(stream, peer, cfg, registry, false).await
+}
+
+/// 若对端是**可信反代 / CDN 回源**，用 `X-Forwarded-For` 里的地址替换对端 IP。
+///
+/// 只在 [`ServerConfig::trusted_proxies`] 命中时才采信 —— 这个头谁都能伪造，
+/// 无条件信任等于给所有人一个"自称内网地址"的后门（能绕 IP 黑名单）。
+fn apply_forwarded_for(peer: SocketAddr, detected: &Detected, cfg: &ServerConfig) -> SocketAddr {
+    let Detected::Ws {
+        forwarded_for: Some(ip),
+    } = detected
+    else {
+        return peer;
+    };
+    if !trusted_proxy(cfg, &peer.ip()) {
+        return peer;
+    }
+    debug!(%peer, real = %ip, "采信 X-Forwarded-For（对端在 trusted_proxies 里）");
+    SocketAddr::new(*ip, peer.port())
+}
+
+/// 对端地址是否落在 `trusted_proxies` 的某条 CIDR / 单 IP 里。
+fn trusted_proxy(cfg: &ServerConfig, ip: &std::net::IpAddr) -> bool {
+    cfg.trusted_proxies
+        .iter()
+        .any(|spec| cidr_match(spec.trim(), ip))
+}
+
+/// 极简 CIDR 匹配：支持 `10.0.0.0/8`、`::1/128` 与裸 IP。
+///
+/// 没引 `ipnet` —— 就这一个函数用得上，v4/v6 各转成整数比一下即可。
+fn cidr_match(spec: &str, ip: &std::net::IpAddr) -> bool {
+    let (net, bits) = match spec.split_once('/') {
+        Some((n, b)) => (n.trim(), b.trim().parse::<u32>().ok()),
+        None => (spec, None),
+    };
+    let Ok(net_ip) = net.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let (net_bits, ip_bits, max) = match (net_ip, ip) {
+        (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+            (u32::from(a) as u128, u32::from(*b) as u128, 32u32)
+        }
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => (u128::from(a), u128::from(*b), 128u32),
+        _ => return false,
+    };
+    let prefix = bits.unwrap_or(max).min(max);
+    let mask: u128 = if prefix == 0 {
+        0
+    } else {
+        (!0u128) << (128 - prefix)
+    };
+    (net_bits & mask) == (ip_bits & mask)
 }
 
 /// 在一条已就绪的流上继续分层。

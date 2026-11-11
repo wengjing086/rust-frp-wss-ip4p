@@ -94,6 +94,7 @@ pub mod http1;
 pub mod http_relay;
 pub mod httpc;
 pub mod ip4p;
+pub mod ipgeo;
 pub mod logfile;
 pub mod net_proxy;
 /// NLink v1：可协商、可回退、零额外往返的扩展层。

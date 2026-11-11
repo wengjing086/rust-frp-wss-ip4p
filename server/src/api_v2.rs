@@ -431,10 +431,16 @@ fn clients_response(registry: &Registry, q: &Query) -> Result<Response, ApiError
                 || c.user.to_ascii_lowercase().contains(&needle)
         })
         .map(|c| {
+            // ★ v0.8.1：`clientIP` 与官方 frps `/api/v2/clients` 同名字段对齐
+            //   （官方只在 v2 里给这个字段）。`ipLocation` 是本项目附加的
+            //   国内归属地短串，境外 / 内网 / 未查出时为空串。
+            let ip = crate::ipinfo::describe(&c.client_ip);
             serde_json::json!({
                 "run_id": c.run_id,
                 "client_id": c.client_id,
                 "user": c.user,
+                "clientIP": ip.ip,
+                "ipLocation": ip.geo,
                 "proxies": c.proxies.len(),
                 "proxy_names": c.proxies,
                 "backlog": c.backlog,

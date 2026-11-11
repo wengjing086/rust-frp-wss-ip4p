@@ -3,7 +3,7 @@
 # <frps|frpc>_<平台>_<架构>[.exe]，不使用压缩包。
 set -u
 
-cd "$(dirname "$0")" || exit 1
+cd "$(dirname "$0")/.." || exit 1   # 回到仓库根：target/ 与 dist/ 都在这一层
 
 export PATH="/c/Users/xnj/WorkBuddy/2026-11-11-10-04-35/_tools/mingw/mingw64/bin:$PATH"
 export CC_x86_64_pc_windows_gnu="C:/Users/xnj/WorkBuddy/2026-11-11-10-04-35/_tools/mingw/mingw64/bin/gcc.exe"

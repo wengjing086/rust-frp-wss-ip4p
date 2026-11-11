@@ -10,6 +10,8 @@
 | ② frps / frpc 支持 **WSS** | frps 在 `bindPort` 上同时接受 TCP / TLS / WSS；frpc 用官方 `transport.protocol = "wss"` 直连，无需 nginx |
 | ③ frpc 支持 **IP4P** | 拨号前解析 DNS TXT（base64/明文 `IP:端口`）→ IP4P AAAA 编码 → 回退普通模式 |
 | ④ **不被杀毒软件误杀** | Rust 原生编译（无 Go 运行时特征）+ 完整版本资源 + `asInvoker` 清单 + 不加壳不混淆 + 可复现构建与 SHA256 校验 |
+| ⑤ **放在 CDN / WAF 后面能连上** | 0.8.1：服务端按"HTTP 请求 + WebSocket 升级"判定，**路径随便配**（绕开 WAF 对 `/~!frp` 的 403），并对 CDN 回源健康检查回 200（消掉 520） |
+| ⑥ 面板显示**真实 IP + 国内归属地** | `/api/v2/clients` 的 `clientIP` + `ipLocation`、`/api/status` 的 `client_ip_geo`；在线查询省市运营商，缓存 7 天，可关 |
 | 修好代码并发布 | 源码在 GitHub，Release 提供多平台预编译二进制与 `SHA256SUMS.txt` |
 
 ---
@@ -78,6 +80,30 @@ frpc -c frpc.toml
 
 看到 `login to server success` 即成功。
 
+### 2.1 放在 CDN / WAF 后面（0.8.1+）
+
+CDN 场景有两个坑，**都不是客户端能单方面解决的**：
+
+* `GET /~!frp` 会被 WAF 当扫描流量拦掉（实测阿里云 ESA 直接 `403 Forbidden`）；
+* CDN 回源健康检查发 `GET /`，老 frps 不会答 HTTP ⇒ CDN 判源站不健康，对外 `520`。
+
+0.8.1 起服务端按"合法 WebSocket 升级请求"判定，**路径不再限制**，并且对普通
+HTTP 请求回 200。客户端只需要把路径换成"正常业务路径"，Host 用给 CDN 的域名：
+
+```toml
+[transport]
+protocol = "wss"
+
+[transport.tls]
+serverName = "frps.example.com"   # ← 给 CDN 用的域名：TLS SNI + HTTP Host 都用它
+
+[transport.websocket]
+path = "/ws"                      # ← 绕开 WAF 对 /~!frp 的拦截
+```
+
+完整部署步骤（含 ESA 侧要改哪几项、怎么用 `probe_cdn.py` 分清 403 与 520）
+见 [docs/CDN.md](docs/CDN.md)。
+
 ### 3. IP4P（同样不用改配置）
 
 把 `serverAddr` 填成发布 IP4P 记录的域名即可，**无需任何新键**：
@@ -105,7 +131,31 @@ ip4p: 由 TXT 记录解析出服务端地址 host=your.ip4p.example.com resolved
 `dnsServer`（官方已有键）若配置，TXT / AAAA 查询会走它；否则走系统 DNS。
 `serverAddr` 是 IP 字面量时**完全跳过 DNS 查询**，零额外开销。
 
-详见 [docs/IP4P.md](docs/IP4P.md) 与 [docs/WSS.md](docs/WSS.md)。
+详见 [docs/IP4P.md](docs/IP4P.md)、[docs/WSS.md](docs/WSS.md) 与 [docs/CDN.md](docs/CDN.md)。
+
+### 4. 面板里的真实 IP 与归属地（0.8.1+）
+
+```jsonc
+// GET /api/v2/clients?all=1
+{ "clientIP": "223.5.5.5", "ipLocation": "浙江 杭州 阿里云", ... }
+
+// GET /api/status → clients[]
+{ "client_ip": "223.5.5.5", "client_ip_geo": "浙江 杭州 阿里云",
+  "client_ip_full": "223.5.5.5 (浙江 杭州 阿里云)", ... }
+```
+
+* **只对中国大陆 IP 追加归属地**，境外 / 内网 / 保留地址只显示 IP；
+* 在线查询（百度 open data → ip-api → ip.sb 依次降级），结果缓存 7 天到
+  `ipgeo_cache.json`，重启不重查；
+* 查询是异步的：面板第一轮可能只看到 IP，下一轮刷新就带上归属地，**不阻塞接口**；
+* 放在 CDN 后面时，客户端 IP 取自 `X-Forwarded-For`，**必须先配白名单**：
+
+```toml
+trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12"]   # CDN 回源网段
+```
+
+* 不想让 IP 出网就关掉：`ipgeo = false`（或环境变量 `NFRP_IPGEO=0`），
+  此时不会发出任何一次查询。
 
 ---
 

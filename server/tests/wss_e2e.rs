@@ -27,20 +27,28 @@ use tokio::net::{TcpListener, TcpStream};
 const TOKEN: &str = "wss-e2e-token";
 
 async fn start_server() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("local_addr").port();
-    let cfg = ServerConfig {
+    start_server_with(ServerConfig {
         bind_addr: "127.0.0.1".into(),
         token: TOKEN.to_string(),
         ..Default::default()
-    };
+    })
+    .await
+    .0
+}
+
+/// 起一个服务端并**把注册表交出来**（测 `X-Forwarded-For` 要看客户端 IP）。
+async fn start_server_with(cfg: ServerConfig) -> (u16, Arc<Registry>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let registry = Arc::new(Registry::unlimited());
+    let reg = registry.clone();
     tokio::spawn(async move {
-        if let Err(e) = serve_on(listener, Arc::new(cfg), Arc::new(Registry::unlimited())).await {
+        if let Err(e) = serve_on(listener, Arc::new(cfg), reg).await {
             eprintln!("测试服务端退出：{e:#}");
         }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    port
+    (port, registry)
 }
 
 fn tls_options(disable_custom_first_byte: bool) -> tls::ClientTlsOptions<'static> {
@@ -128,4 +136,195 @@ async fn plain_websocket_login_still_works() {
         .await
         .expect("WebSocket 升级（明文）");
     login(Box::pin(ws)).await;
+}
+
+// ---------------------------------------------------------------------------
+// ★ v0.8.1：CDN 适配
+// ---------------------------------------------------------------------------
+
+/// **CDN 场景的核心用例**：路径换成 `/ws` 也必须能升级。
+///
+/// 背景：官方默认路径 `/~!frp` 里的 `~!` 在阿里云 ESA 这类 WAF 上很容易被
+/// 当成扫描流量直接 403。客户端把 `[transport.websocket] path` 改成 `/ws`
+/// 之后，服务端**不能**再死认 `GET /~!frp`，否则这条链路永远握不上手。
+#[tokio::test]
+async fn wss_login_with_custom_path() {
+    let port = start_server().await;
+    let tcp = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连接服务端");
+    let tls_stream = tls::connect_client(Box::pin(tcp), &tls_options(true))
+        .await
+        .expect("TLS 握手");
+    let ws = ws::connect(tls_stream, "frps.example.com", "/ws", &[])
+        .await
+        .expect("自定义路径的 WSS 升级");
+    login(Box::pin(ws)).await;
+}
+
+/// 明文分支同样支持自定义路径（`protocol = "websocket"` + CDN 明文回源）。
+#[tokio::test]
+async fn plain_websocket_with_custom_path() {
+    let port = start_server().await;
+    let tcp = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连接服务端");
+    let ws = ws::connect(Box::pin(tcp), "frps.example.com", "/api/v1/stream", &[])
+        .await
+        .expect("自定义路径的明文 WS 升级");
+    login(Box::pin(ws)).await;
+}
+
+/// **CDN 回源健康检查**：`GET /` 必须拿到 200。
+///
+/// 老实现会把这条明文 HTTP 丢给 TLS 协商，协商失败直接断连 ——
+/// CDN 于是判定"源站不健康"，对外回 520 / 403，客户端连 101 都看不到。
+#[tokio::test]
+async fn cdn_health_check_gets_200() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let port = start_server().await;
+    let mut tcp = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连接服务端");
+    tcp.write_all(b"GET / HTTP/1.1\r\nHost: frps.example.com\r\nUser-Agent: esa-health\r\n\r\n")
+        .await
+        .expect("发送健康检查请求");
+    let mut resp = String::new();
+    tcp.read_to_string(&mut resp).await.expect("读取响应");
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "CDN 健康检查必须拿到 200，实际：{resp:?}"
+    );
+}
+
+/// HTTPS 回源的 CDN：健康检查走 TLS，结论必须一样（200）。
+#[tokio::test]
+async fn cdn_https_health_check_gets_200() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let port = start_server().await;
+    let tcp = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连接服务端");
+    let mut tls_stream = tls::connect_client(Box::pin(tcp), &tls_options(true))
+        .await
+        .expect("TLS 握手");
+    tls_stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: frps.example.com\r\n\r\n")
+        .await
+        .expect("发送健康检查请求");
+    let mut resp = String::new();
+    tls_stream
+        .read_to_string(&mut resp)
+        .await
+        .expect("读取响应");
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "HTTPS 回源的健康检查必须拿到 200，实际：{resp:?}"
+    );
+}
+
+/// 带 `X-Forwarded-For` 的 CDN 回源：配了 `trusted_proxies` 才采信，
+/// 采信后注册表里出来的是**真实客户端 IP**，不是 CDN 的回源地址。
+#[tokio::test]
+async fn trusted_proxy_uses_forwarded_for() {
+    let (port, registry) = start_server_with(ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        token: TOKEN.to_string(),
+        trusted_proxies: vec!["127.0.0.1/32".into()],
+        ..Default::default()
+    })
+    .await;
+
+    let tcp = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连接服务端");
+    let tls_stream = tls::connect_client(Box::pin(tcp), &tls_options(true))
+        .await
+        .expect("TLS 握手");
+    let ws = ws::connect(
+        tls_stream,
+        "frps.example.com",
+        "/ws",
+        &[("X-Forwarded-For", "203.0.113.9, 10.0.0.2")],
+    )
+    .await
+    .expect("带 XFF 的 WSS 升级");
+
+    let metas: HashMap<String, String> = HashMap::new();
+    let (conn, run_id, _udp, _caps) = conn::client_handshake(
+        Box::pin(ws),
+        WireVersion::V2,
+        &Credential::Token(TOKEN.to_string()),
+        "cdn-client",
+        "cdn-user",
+        &metas,
+        0,
+        Default::default(),
+    )
+    .await
+    .expect("frp 握手必须成功");
+
+    let ip = registry
+        .clients()
+        .into_iter()
+        .find(|c| c.run_id == run_id)
+        .map(|c| c.client_ip);
+    assert_eq!(
+        ip,
+        Some("203.0.113.9".parse().unwrap()),
+        "可信反代场景下必须用 X-Forwarded-For 里的客户端地址"
+    );
+    drop(conn);
+}
+
+/// 没配 `trusted_proxies` 时**不能**采信 XFF —— 否则任何人都能自称任意 IP，
+/// 直接绕过 IP 白黑名单。
+#[tokio::test]
+async fn untrusted_peer_ignores_forwarded_for() {
+    let (port, registry) = start_server_with(ServerConfig {
+        bind_addr: "127.0.0.1".into(),
+        token: TOKEN.to_string(),
+        ..Default::default()
+    })
+    .await;
+
+    let tcp = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连接服务端");
+    let ws = ws::connect(
+        Box::pin(tcp),
+        "frps.example.com",
+        "/ws",
+        &[("X-Forwarded-For", "203.0.113.9")],
+    )
+    .await
+    .expect("明文 WS 升级");
+
+    let metas: HashMap<String, String> = HashMap::new();
+    let (conn, run_id, _udp, _caps) = conn::client_handshake(
+        Box::pin(ws),
+        WireVersion::V2,
+        &Credential::Token(TOKEN.to_string()),
+        "spoof-client",
+        "spoof-user",
+        &metas,
+        0,
+        Default::default(),
+    )
+    .await
+    .expect("frp 握手必须成功");
+
+    let ip = registry
+        .clients()
+        .into_iter()
+        .find(|c| c.run_id == run_id)
+        .map(|c| c.client_ip);
+    assert_eq!(
+        ip,
+        Some("127.0.0.1".parse().unwrap()),
+        "没白名单时必须忽略伪造的 X-Forwarded-For"
+    );
+    drop(conn);
 }

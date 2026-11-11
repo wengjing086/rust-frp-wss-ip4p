@@ -824,6 +824,32 @@ pub struct ServerConfig {
     )]
     pub udp_packet_size: usize,
 
+    /// 可信反代 / CDN 回源地址（CIDR 或单个 IP，如 `10.0.0.0/8`）。
+    ///
+    /// ★ v0.8.1：服务端只有在"对端地址命中这里的某条"时**才采信**
+    /// `X-Forwarded-For`，用它替换连接的对端 IP（面板显示、IP 白黑名单、
+    /// 审计日志都会用替换后的地址）。
+    ///
+    /// 为什么要限定白名单：`X-Forwarded-For` 是请求头，谁都能伪造。
+    /// 无条件信任等于让任何客户端自称 `127.0.0.1` 绕过 IP 黑名单。
+    /// 默认空列表 = 永远不采信（与旧行为一致）。
+    ///
+    /// CDN 部署示例：frps 只接受 CDN 回源，就填 CDN 的回源网段；
+    /// 自建 nginx 反代同机则填 `127.0.0.1/32`。
+    #[serde(default, alias = "trustedProxies")]
+    pub trusted_proxies: Vec<String>,
+
+    /// 面板 / 接口里给客户端 IP 追加**国内归属地**（省 市 运营商）。
+    ///
+    /// ★ v0.8.1：默认开启。开启后，**被面板或 API 看到**的客户端 IP 会被
+    /// 发往第三方在线接口查询（百度 open data → ip-api → ip.sb），
+    /// 结果缓存 7 天。境外 / 内网 / 保留地址只显示 IP，不查询。
+    ///
+    /// 介意隐私、或服务器完全没有外网出口时置 `false`（也可用环境变量
+    /// `NFRP_IPGEO=0` 临时关掉），此时不会发出任何一次查询。
+    #[serde(default = "default_true")]
+    pub ipgeo: bool,
+
     /// 面板静态资源目录（官方 frps 的 `webServer.assetsDir`）。
     ///
     /// ★ v0.6.6：配了它之后，面板的 `/` 与其它路径会**优先从这个目录读文件**，
@@ -1399,6 +1425,8 @@ impl Default for ServerConfig {
             web_server: WebServerConfig::default(),
             enable_prometheus: false,
             udp_packet_size: default_udp_packet_size(),
+            trusted_proxies: Vec::new(),
+            ipgeo: true,
             assets_dir: String::new(),
             pprof_enable: false,
             nathole_analysis_data_reserve_hours: default_nathole_analysis_reserve_hours(),

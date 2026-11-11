@@ -156,6 +156,29 @@ fn hoist_inverted_bool(t: &mut toml::Table, path: &[&str], from: &str, to: &str)
     }
 }
 
+/// 把官方 `[transport.websocket] host / path` 搬成 NFrp 的 `websocket` 子表。
+///
+/// 官方把这两项放在 `transport` 下面，NFrp 的 `ClientConfig` 用一个
+/// [`crate::ws::WebSocketConfig`] 子表接住（`websocket.host` / `websocket.path`）。
+/// 不搬的话，写在 frpc.toml 里的路径会被 serde 静默丢弃，
+/// 客户端仍然发 `/~!frp` —— 放在 CDN 后面就是必然的 403。
+fn hoist_websocket(t: &mut toml::Table) {
+    let Some(sub) = sub_table_at(t, &["transport", "websocket"]) else {
+        return;
+    };
+    let mut table = toml::Table::new();
+    for key in ["host", "path"] {
+        if let Some(k) = find_key_ci(sub, key) {
+            if let Some(v) = sub.get(&k) {
+                table.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    if !table.is_empty() && !t.contains_key("websocket") {
+        t.insert("websocket".to_string(), Value::Table(table));
+    }
+}
+
 /// 遍历根表下某个数组表（`[[proxies]]` / `[[visitors]]`）里的每条记录。
 fn for_each_record(root: &mut toml::Value, key: &str, f: impl Fn(&mut toml::Table)) {
     let Some(t) = root.as_table() else {
@@ -573,6 +596,14 @@ pub fn normalize_client(root: &mut toml::Value) {
         "disableCustomTLSFirstByte",
         "tls_custom_first_byte",
     );
+
+    // ★ v0.8.1：`[transport.websocket] host / path`。
+    //
+    // 这两个字段在 CDN / 反代场景下是刚需：官方默认路径 `/~!frp` 里的 `~!`
+    // 很容易被 WAF 当扫描流量拦掉（阿里云 ESA 实测直接 403），
+    // 客户端必须能把路径改成 `/ws` 这种"正常业务"路径。
+    // 不搬过来的话，配置里写了也不生效，用户会以为是服务端不认路径。
+    hoist_websocket(t);
 
     // 认证令牌：frp 新写法 `auth.token`，老写法 `[common] token`。
     // NFrp 只有顶层 `token` 一个。
@@ -1115,6 +1146,45 @@ role = "proxy-role"
         // 不能互相串台
         assert!(!cfg.proxies[0].metas.contains_key("token"));
         assert!(!cfg.metas.contains_key("role"));
+    }
+
+    /// ★ v0.8.1：`[transport.websocket] path / host` 必须真的生效。
+    ///
+    /// 这是 CDN 场景的**前置条件**：WAF 会拦 `/~!frp`，用户只能改路径。
+    /// 如果这一段被 serde 静默丢弃，客户端仍然发老路径 —— 现象就是
+    /// "配置看起来改了，日志里还是 403"，极难排查。
+    #[test]
+    fn transport_websocket_子表要搬到_websocket_字段() {
+        let text = r#"
+serverAddr = "frps.wengjing.top"
+serverPort = 443
+auth.method = "token"
+auth.token = "t"
+
+[transport]
+protocol = "wss"
+
+[transport.tls]
+serverName = "frps.wengjing.top"
+
+[transport.websocket]
+host = "frps.wengjing.top"
+path = "/ws"
+"#;
+        let cfg = parse_client_toml(text).unwrap();
+        assert_eq!(cfg.transport_protocol, "wss");
+        assert_eq!(cfg.tls_server_name, "frps.wengjing.top");
+        assert_eq!(cfg.websocket.host, "frps.wengjing.top");
+        assert_eq!(cfg.websocket.path, "/ws");
+        assert_eq!(cfg.websocket.effective_path(), "/ws");
+        assert!(cfg.websocket_tls(), "wss 应当走 TLS");
+    }
+
+    /// 没配 `[transport.websocket]` 时不能凭空造出路径（保持官方默认）。
+    #[test]
+    fn 没有_websocket_子表时路径仍是官方默认() {
+        let cfg = parse_client_toml("serverAddr = \"a.example.com\"\n").unwrap();
+        assert_eq!(cfg.websocket.effective_path(), crate::ws::FRP_WS_PATH);
     }
 
     #[test]

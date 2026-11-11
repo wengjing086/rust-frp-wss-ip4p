@@ -54,21 +54,40 @@ location /~!frp {
 > 对比：官方 frps 必须这样绕；**本项目 frps 不需要** —— 它能在 `bindPort` 上直接
 > 接住 `wss`。有 nginx 只是为了复用一个 443，不是功能上的必需。
 
-## 情况二：域名走了 CDN（最常见）
+## 情况二：域名走了 CDN（最常见的 403，但结论可能反直觉）
 
 典型特征是响应里带 `Server: ESA`、`via: ...ens-cache...`、`EagleId`、
-`Set-Cookie: acw_tc=...` 这类头。此时：
+`Set-Cookie: acw_tc=...` 这类头。
 
-- 403 是 **CDN 的 WAF** 给的：`/~!frp` 这种"路径里带特殊字符 + 立即 Upgrade"
-  的请求在风控规则里很像扫描器，会被直接拦掉；
-- 就算放行了路径，普通 HTTPS 请求还会看到 `520 Origin Error` /
-  `error=http_response_incomplete` —— 因为源站是 frps，它收到 TLS 后不会回
-  HTTP 响应，CDN 判定"回源异常"。
+先别急着改路径。实测（2026-11，阿里云 ESA，**WAF 规则全部放行**）：
 
-**结论：frp 的控制连接不要过 CDN。** 隧道流量是长连接 + 非 HTTP 语义，CDN 的
-缓存与风控模型都不适合它，即使勉强通了，限速和断流也会让你不停重连。
+```text
+GET /~!frp  无 Origin               → 403 Forbidden   (Server: ESA)
+GET /~!frp  +Origin                 → 101 通
+GET /~!frp  +User-Agent（无 Origin） → 403
+```
 
-正确的做法是让 frpc **直连源站**：
+也就是说 403 的来源是「**带 `Upgrade: websocket` 却没有 `Origin` 头**」——
+云 WAF 把这种请求当成非浏览器的自动化流量，直接拒，且响应体为空。
+**它在路径规则之前就判完了**，所以控制台里怎么放行 `/~!frp` 都不生效。
+
+- **v0.8.1 及以后**：客户端已自动带 `Origin`，默认路径 `/~!frp` 直接可用，
+  不需要改任何配置。
+- **0.8.0 及更早**：要么换新版客户端，要么在客户端前面自己补头（不推荐）。
+
+> 判断口诀：**同一条链路 Go 版 frpc 通、别的客户端 403 ⇒ 先怀疑缺 `Origin`**。
+> 因为 `golang.org/x/net/websocket` 的 `Dial()` 必然写 `Origin: http://<host>`。
+
+至于 `520 Origin Error` / `error=http_response_incomplete`：源站是 frps 时，
+它收到 TLS 后不回 HTTP 响应，CDN 就判"回源异常"。这**只影响健康检查和换路径**，
+不影响默认路径的 wss 登录。要让 520 消失，把源站换成 0.8.1+ 的 frps
+（它会对 `GET /` 回 200）。详见 [CDN.md](CDN.md)。
+
+如果确认 WAF 是**按路径**拦的（带 `Origin` 仍 403，或者报 404/520），
+再改路径：客户端 `[transport] websocket.path = "/ws"`，并要求服务端认这个路径
+（本项目 frps 认任意路径；官方 frps 只认 `/~!frp`，需要打补丁）。
+
+如果只是不想让隧道流量经过 CDN，也可以让 frpc **直连源站**：
 
 1. 在 DNS 里把该记录改成"仅解析"（阿里云叫"关闭 CDN 加速"、Cloudflare 叫灰云
    `DNS only`），让它直接指向源站 IP；

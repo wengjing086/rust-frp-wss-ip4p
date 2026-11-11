@@ -1320,10 +1320,17 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
         );
     }
 
-    let host = if cfg.websocket.host.trim().is_empty() {
-        cfg.server_addr.as_str()
-    } else {
+    // ★ v0.8.1：Host 头的回落顺序是
+    //   `[transport.websocket] host` → `[transport.tls] serverName` → `serverAddr`。
+    //
+    //   走 CDN 时 `serverAddr` 经常是 IP（或者 IP4P 的 TXT 域名），
+    //   而 CDN 是**按 Host / SNI 找站点**的：Host 填成 IP 会直接 403 / 502。
+    //   用户既然填了 `tls.serverName`，那就是"这个域名是给 CDN 用的"，
+    //   Host 必须跟着它走，否则链路必然失败。
+    let host = if !cfg.websocket.host.trim().is_empty() {
         cfg.websocket.host.as_str()
+    } else {
+        name
     };
     let path = cfg.websocket.effective_path();
     let ws = ws::connect(stream, host, path, &[])

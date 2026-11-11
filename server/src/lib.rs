@@ -15,6 +15,7 @@ pub mod api_v2;
 pub mod audit;
 pub mod dashboard;
 pub mod guard;
+pub mod ipinfo;
 pub mod limits;
 pub mod nathole_official;
 pub mod nlink;

@@ -940,12 +940,19 @@ fn status_json(registry: &Registry, snap: &Snapshot) -> String {
         .clients()
         .iter()
         .map(|c| {
+            let ip = crate::ipinfo::describe(&c.client_ip);
             serde_json::json!({
                 // run_id 必须带上：面板的"新增代理 / 踢出"是拿它当主键的。
                 // client_id 会重复（同一个 client_id 重连多次），不能当主键用。
                 "run_id": c.run_id,
                 "client_id": c.client_id,
                 "user": c.user,
+                // ★ v0.8.1：真实客户端 IP + 国内归属地（省 市 运营商）。
+                // `client_ip` 是裸地址，`client_ip_geo` 可能为空（境外 / 内网 /
+                // 第一次查询还没回来），前端按"空就不加括号"处理。
+                "client_ip": ip.ip,
+                "client_ip_geo": ip.geo,
+                "client_ip_full": ip.full,
                 "proxies": c.proxies,
                 "backlog": c.backlog,
                 "idle_work_conns": c.idle_work_conns,
@@ -1196,8 +1203,11 @@ async function refresh(){
     ].join('');
     window.__clients = s.clients||[];
     document.getElementById('clients').innerHTML = table(
-      ['客户端', 'user', '代理', '排队', '空闲', '管理'],
-      (s.clients||[]).map(c=>[c.client_id, c.user||'-', (c.proxies||[]).join(', ')||'-',
+      ['客户端', 'user', '客户端 IP', '代理', '排队', '空闲', '管理'],
+      (s.clients||[]).map(c=>[c.client_id, c.user||'-',
+        // 归属地是异步补查的：第一轮可能是裸 IP，下一轮刷新就带上了
+        c.client_ip_full || c.client_ip || '-',
+        (c.proxies||[]).join(', ')||'-',
         c.backlog, c.idle_work_conns,
         // ★ H4：这是**唯一**需要嵌 HTML 的单元格 ⇒ 用 raw() 显式标记，
         //   否则会被 esc() 转义成文本、按钮显示不出来。
