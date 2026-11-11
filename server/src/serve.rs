@@ -1590,6 +1590,17 @@ async fn handle_control(
         client_id = %nfrp_common::util::LogSafe(&client_id), %run_id, os = %login.os, arch = %login.arch,
         wire = %wire_version, "客户端登录成功"
     );
+    // 官方面板 `/api/clients` 的数据源：登录即建档（重连刷新 run_id / 时间）。
+    registry.sessions.mark_login(
+        &client_id,
+        &login.user,
+        &run_id,
+        &login.version,
+        &login.hostname,
+        &login.os,
+        &login.arch,
+        &peer.ip().to_string(),
+    );
 
     let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<CtrlCmd>();
     // ★★ v0.5.6 修（审计总报告 M15，中危）：**补上上界钳制**。
@@ -2070,6 +2081,14 @@ async fn handle_control(
                                 }
                                 let remote_addr = outcome.remote_addr;
                                 info!(proxy = %name, port, remote = %remote_addr, "代理注册成功");
+                                // 官方面板统计：注册即开账（重连保历史流量）。
+                                registry.stats.open(
+                                    &name,
+                                    &m.proxy_type,
+                                    &client.user,
+                                    &client.client_id,
+                                    proxy_conf_json(&m),
+                                );
                                 registry.audit().record(
                                     crate::audit::AuditEvent::new(
                                         crate::audit::kind::PROXY_ADD,
@@ -2214,6 +2233,8 @@ async fn handle_control(
                         if let Some(port) = client.stop_proxy(&m.proxy_name) {
                             registry.metrics().proxies_active.dec();
                             registry.release_port(port, &client, &m.proxy_name);
+                            // 官方面板语义：代理确实摘掉才置离线 + 记关闭时间。
+                            registry.stats.mark_closed(&m.proxy_name);
                         } else {
                             // 名字对不上：什么都没清理。留一条 debug 便于排查
                             // （不改指标 —— 这正是 M8 的修法）。
@@ -2343,6 +2364,10 @@ async fn handle_control(
     // 监听器、端口、vhost 路由、visitor 记录全部原地保留 `resume_ttl` 秒；
     // 续传命中时新控制连接直接接管这份状态，公网端口在切换窗口里不需要
     // 重新 bind，也不会被别人抢走。
+    //
+    // 无论是否续传，控制连接已断 ⇒ 官方面板口径里该客户端**离线**
+    // （续传只是保住端口与代理，`/api/clients` 的 online 仍为 false）。
+    registry.sessions.mark_offline(&client_id);
     if let Some(st) = &nlink_state {
         if allow_resume
             && st.caps.contains(nfrp_common::nlink::CAP_RESUME)
@@ -2393,6 +2418,26 @@ async fn handle_control(
     }
 
     Ok(())
+}
+
+/// 官方面板 `conf` 字段的配置摘要（v1 `/api/proxy/*` 直接返回它）。
+///
+/// 官方回的是完整的 ProxyConfigurer；我们只回**有实际内容**的公共字段，
+/// 前端主要展示类型 / 端口 / 域名这些，足够渲染。
+fn proxy_conf_json(m: &nfrp_common::frp::msg::NewProxy) -> serde_json::Value {
+    serde_json::json!({
+        "name": m.proxy_name,
+        "type": m.proxy_type,
+        "useEncryption": m.use_encryption,
+        "useCompression": m.use_compression,
+        "remotePort": m.remote_port,
+        "customDomains": m.custom_domains,
+        "subdomain": m.subdomain,
+        "locations": m.locations,
+        "hostHeaderRewrite": m.host_header_rewrite,
+        "multiplexer": m.multiplexer,
+        "sk": nfrp_common::util::LogSafe(&m.sk).to_string(),
+    })
 }
 
 /// `NewProxy` 的确定性指纹（续传复用判据）。
@@ -3588,14 +3633,35 @@ struct ConnGuard<'a> {
     registry: &'a Registry,
     /// 结束时要把流量统计一起记账（`relay_between` 的返回值）。
     bytes: std::cell::Cell<(u64, u64)>,
+    /// 关联的代理全名；`Some` 时离开作用域会把流量 / 连接数记到
+    /// `registry.stats`（官方面板的按代理统计）。
+    proxy: Option<String>,
 }
 
 impl<'a> ConnGuard<'a> {
+    /// 全局计数守卫（不挂代理）。生产路径都用 [`Self::for_proxy`]；
+    /// 纯计数语义的单元测试仍用本函数。
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(registry: &'a Registry) -> Self {
         registry.metrics().conns_active.inc();
         Self {
             registry,
             bytes: std::cell::Cell::new((0, 0)),
+            proxy: None,
+        }
+    }
+
+    /// 与 [`Self::new`] 相同，额外按代理记一笔"当前连接 +1"
+    /// （`-1` 由 [`Drop`] 兜底，与全局 gauge 同一套 RAII 语义）。
+    ///
+    /// 不能用 `Self { proxy: .., ..g }`——类型实现了 `Drop`，禁止按字段搬移。
+    fn for_proxy(registry: &'a Registry, proxy: &str) -> Self {
+        registry.metrics().conns_active.inc();
+        registry.stats.conn_open(proxy);
+        Self {
+            registry,
+            bytes: std::cell::Cell::new((0, 0)),
+            proxy: Some(proxy.to_string()),
         }
     }
 
@@ -3611,6 +3677,11 @@ impl Drop for ConnGuard<'_> {
         self.registry.metrics().bytes_up.inc_by(up);
         self.registry.metrics().bytes_down.inc_by(down);
         self.registry.metrics().conns_active.dec();
+        if let Some(name) = &self.proxy {
+            // 官方语义：TrafficIn = workConn→userConn（下行），TrafficOut = 上行。
+            self.registry.stats.add_traffic(name, down, up);
+            self.registry.stats.conn_close(name);
+        }
     }
 }
 
@@ -3669,7 +3740,7 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
     // ★★ v0.5.6（M7）：**配对成功这一刻**建守卫 ⇒ +1，且保证**只有一次**。
     //   于是 `admit_user` 与 `handle_work` 里那两处 inc 都不需要了
     //   （它们分别在"用户到达"和"工作连接配对"时各加一次，导致 +2/-1）。
-    let guard = ConnGuard::new(registry);
+    let guard = ConnGuard::for_proxy(registry, &proxy);
 
     work_conn
         .send_msg(&FrpMessage::StartWorkConn(StartWorkConn {
@@ -3794,7 +3865,7 @@ async fn sudp_bridge(
     // ★★ v0.5.6（M7）：配对成功这一刻建守卫 ⇒ +1，且离开作用域必然 -1。
     //   原先 `finish_conn` 只在最后一行调用，而下面 `?` 提前返回时会漏掉
     //   （审计报告指出的 `:1905` / `:1913` 两处）。
-    let guard = ConnGuard::new(registry);
+    let guard = ConnGuard::for_proxy(registry, &proxy_name);
 
     // ★ 与官方 frps 一致：拿到工作连接后**先**发 `StartWorkConn` 告诉客户端
     //   "这条连接服务哪个代理"，之后才谈业务帧。

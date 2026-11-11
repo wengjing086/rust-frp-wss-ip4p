@@ -19,7 +19,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
 
 use crate::{
-    admin, api_v2,
+    admin, api_v2, official_api, web_assets,
     observability::{encode_json, encode_prometheus, Snapshot},
     registry::Registry,
 };
@@ -59,10 +59,10 @@ const METRIC_PREFIX: &str = "nfrp";
 ///
 /// # CSP 的取舍
 ///
-/// 面板 HTML 的所有脚本与样式都是内联的（`html_page()` 单文件），所以
-/// `script-src` / `style-src` 必须允许 `'unsafe-inline'`。这不是疏忽 ——
-/// 在一个自包含页面上，能挡的部分是 `default-src 'none'`（禁止一切外域
-/// 请求、图片、字体、frame），而那正好是最有价值的部分。
+/// 面板有两套前端：老的单文件 HTML（脚本样式内联，需要 `'unsafe-inline'`）
+/// 与官方面板（v0.72 Vue 构建，`/static/` 下的**同源外部文件**，
+/// 需要 `'self'`）。两条都开：`default-src 'none'` 仍然禁止一切外域
+/// 请求、外域脚本、frame —— 最有价值的部分一点没松。
 const SEC_HEADERS: &[(&str, &str)] = &[
     ("X-Content-Type-Options", "nosniff"),
     ("X-Frame-Options", "DENY"),
@@ -73,8 +73,8 @@ const SEC_HEADERS: &[(&str, &str)] = &[
     ),
     (
         "Content-Security-Policy",
-        "default-src 'none'; script-src 'unsafe-inline'; \
-         style-src 'unsafe-inline'; img-src 'self' data:; \
+        "default-src 'none'; script-src 'self' 'unsafe-inline'; \
+         style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
          connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
     ),
 ];
@@ -395,7 +395,12 @@ where
     // 否则 `DELETE /api/v2/clients` 会先撞上这道总闸、拿到一段纯文本 405，
     // 而调用方（都按信封解析）看到的是"响应体解析不了"—— 版本化 API 的
     // 错误格式必须是**全路径一致**的，不能一半信封一半纯文本。
-    if !matches!(method.as_str(), "GET" | "HEAD" | "POST") && !path.starts_with(api_v2::PREFIX) {
+    // 需要总闸拒绝的方法：非 GET/HEAD/POST，且不是官方面板的
+    // `DELETE /api/proxies?status=offline`（清理离线代理），也不在 api_v2 前缀下。
+    if !(matches!(method.as_str(), "GET" | "HEAD" | "POST")
+        || path.starts_with(api_v2::PREFIX)
+        || (method == "DELETE" && path == "/api/proxies"))
+    {
         send(
             &mut stream,
             405,
@@ -405,6 +410,26 @@ where
             head_only,
         )
         .await?;
+        return Ok(());
+    }
+
+    // 官方面板兼容 API（frp v0.72 契约）——**优先于**自有 api_v2 接管。
+    //
+    // 为什么必须排在前头：两者对 `/api/v2/clients`、`/api/v2/proxies` 等
+    // 路径的**响应信封**不一样（官方是 `{code,msg,data}`，我们自己的是
+    // `{api,data,page}`），官方 Vue 前端按官方契约解析。冲突路径上以
+    // 官方面板为准；`/api/v2/users` 等不冲突路径仍归 api_v2。
+    if let Some(resp) = official_api::route(&registry, &cfg, &method, &path, &query).await {
+        send(
+            &mut stream,
+            resp.status,
+            "application/json; charset=utf-8",
+            resp.body.as_bytes(),
+            SEC_HEADERS,
+            head_only,
+        )
+        .await?;
+        debug!(%peer, %method, %path, status = resp.status, "官方面板请求已处理");
         return Ok(());
     }
 
@@ -614,30 +639,60 @@ where
             .await?;
         }
         "/" | "/index.html" | "/dashboard" => {
-            // ★ v0.6.6（对齐官方 frps 的 `webServer.assetsDir`）：
-            // 配了目录就优先用里面的 index.html，否则用内嵌的那份。
-            match load_asset(cfg.effective_assets_dir(), "index.html") {
-                Some((body, ctype)) => {
+            // ★ v0.8.2：默认面板换成**官方面板**（`/static/` 下的 Vue 应用）。
+            // 老 HTML 面板保留给 `webServer.assetsDir` 换皮用户 —— 配了目录
+            // 仍然优先用目录里的 index.html。
+            if !cfg.effective_assets_dir().is_empty() {
+                if let Some((body, ctype)) = load_asset(cfg.effective_assets_dir(), "index.html") {
                     send(&mut stream, 200, ctype, &body, SEC_HEADERS, head_only).await?;
-                }
-                None => {
-                    let body = html_page();
+                } else {
+                    // 目录里没有 index.html：回退到官方面板，而不是 404。
                     send(
                         &mut stream,
-                        200,
-                        "text/html; charset=utf-8",
+                        302,
+                        "text/plain; charset=utf-8",
+                        b"see /static/\n",
+                        SEC_HEADERS_WITH_REDIRECT.as_slice(),
+                        head_only,
+                    )
+                    .await?;
+                }
+            } else {
+                send(
+                    &mut stream,
+                    302,
+                    "text/plain; charset=utf-8",
+                    b"see /static/\n",
+                    SEC_HEADERS_WITH_REDIRECT.as_slice(),
+                    head_only,
+                )
+                .await?;
+            }
+        }
+        other => {
+            // ★ v0.8.2：`/static/*` 服务内嵌的官方面板资源；
+            // 其余路径仍按 `assets_dir` 找一遍（换皮机制不变）。
+            if let Some(rel) = other.strip_prefix("/static/") {
+                // 目录根 = index.html（与官方 `http.FileServer` 行为一致）。
+                let rel = rel.strip_suffix('/').unwrap_or(rel);
+                let rel = if rel.is_empty() { "index.html" } else { rel };
+                if let Some((body, ctype)) = web_assets::lookup(rel) {
+                    send(&mut stream, 200, ctype, body, SEC_HEADERS, head_only).await?;
+                } else if let Some((body, ctype)) = load_asset(cfg.effective_assets_dir(), rel) {
+                    send(&mut stream, 200, ctype, &body, SEC_HEADERS, head_only).await?;
+                } else {
+                    let body = format!("404 Not Found: {other}\n");
+                    send(
+                        &mut stream,
+                        404,
+                        "text/plain; charset=utf-8",
                         body.as_bytes(),
                         SEC_HEADERS,
                         head_only,
                     )
                     .await?;
                 }
-            }
-        }
-        other => {
-            // 配了 assets_dir 时，其余路径也当作静态资源找一遍
-            // （面板换皮通常还带 css/js/图片）。找不到才 404。
-            if let Some((body, ctype)) = load_asset(cfg.effective_assets_dir(), other) {
+            } else if let Some((body, ctype)) = load_asset(cfg.effective_assets_dir(), other) {
                 send(&mut stream, 200, ctype, &body, SEC_HEADERS, head_only).await?;
             } else {
                 let body = format!("404 Not Found: {other}\n");
@@ -837,6 +892,21 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 static SEC_HEADERS_WITH_AUTH: [(&str, &str); SEC_HEADERS.len() + 1] = concat_headers_auth();
 
 static SEC_HEADERS_WITH_ALLOW: [(&str, &str); SEC_HEADERS.len() + 1] = concat_headers_allow();
+
+/// 302 用：`Location` + 安全头（`/` → 官方面板 `/static/`）。
+const fn concat_headers_redirect() -> [(&'static str, &'static str); SEC_HEADERS.len() + 1] {
+    let mut out = [("", ""); SEC_HEADERS.len() + 1];
+    out[0] = ("Location", "/static/");
+    let mut i = 0;
+    while i < SEC_HEADERS.len() {
+        out[i + 1] = SEC_HEADERS[i];
+        i += 1;
+    }
+    out
+}
+
+static SEC_HEADERS_WITH_REDIRECT: [(&str, &str); SEC_HEADERS.len() + 1] =
+    concat_headers_redirect();
 
 /// 401 用：`WWW-Authenticate` + 安全头。
 const fn concat_headers_auth() -> [(&'static str, &'static str); SEC_HEADERS.len() + 1] {
@@ -1079,6 +1149,9 @@ fn mime_of(p: &std::path::Path) -> &'static str {
     }
 }
 
+/// 老版单文件面板 HTML（v0.8.2 起默认路由切到官方面板 `/static/`，
+/// 这个函数只剩测试引用 —— 保留以便回归与"回滚一版"时用）。
+#[cfg_attr(not(test), allow(dead_code))]
 fn html_page() -> String {
     r#"<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1380,7 +1453,9 @@ mod tests {
         assert!(resp.contains("\"api\":\"v2\""), "缺少版本标识：{resp}");
 
         // ③ query 要真的生效：非法的分页参数必须被拒，而不是悄悄回第一页。
-        let resp = http_get(addr, "/api/v2/clients?page=0", Some(("u", "p"))).await;
+        // （`/api/v2/clients` 已被官方面板兼容 API 接管 —— 它按官方契约把
+        //   非法分页参数**取默认值**而不是拒绝；显式枚举校验留给 visitors。）
+        let resp = http_get(addr, "/api/v2/visitors?page=0", Some(("u", "p"))).await;
         assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
         assert!(resp.contains("bad_request"), "{resp}");
 
@@ -1958,15 +2033,17 @@ Authorization: Basic ",
         // 安全头仍在
         assert!(resp.to_ascii_lowercase().contains("x-frame-options: deny"));
 
-        // 换成空目录 ⇒ 回退到内嵌面板
+        // 换成空目录 ⇒ 默认路由是**官方面板**：302 到 /static/
+        // （v0.8.2 起，assets_dir 只在**显式配置**时才作为首页来源）。
         let empty = tmp_assets("home-empty");
         let (addr2, _h2) = spawn_dashboard_with_assets(&empty.to_string_lossy()).await;
         let resp2 = http_req(addr2, "GET", "/", Some(("u", "p"))).await;
         assert!(
-            resp2.contains("<!DOCTYPE html>") || resp2.contains("<html"),
-            "空目录应当回退到内嵌面板：{}",
-            &resp2[..resp2.len().min(120)]
+            resp2.starts_with("HTTP/1.1 302"),
+            "空 assets_dir 时 / 应当 302 到官方面板：{}",
+            &resp2[..resp2.len().min(160)]
         );
+        assert!(resp2.to_ascii_lowercase().contains("location: /static/"));
 
         let _ = std::fs::remove_dir_all(&d);
         let _ = std::fs::remove_dir_all(&empty);
@@ -2022,7 +2099,7 @@ Authorization: Basic ",
         // ★ v0.6.5：`/metrics` 已改为默认关闭（`enablePrometheus`），
         //   spawn_dashboard() 用的是默认配置，所以这里不能再断言它 200。
         //   它的 HEAD 语义由 `head_works_on_metrics_when_enabled` 覆盖。
-        for path in ["/", "/api/status", "/api/healthz"] {
+        for path in ["/static/", "/api/status", "/api/healthz"] {
             let resp = http_req(addr, "HEAD", path, Some(("u", "p"))).await;
 
             // 状态行 + 头部分
@@ -2051,13 +2128,14 @@ Authorization: Basic ",
     /// 对照：同一个路径用 GET 必须**照常**返回 body。
     ///
     /// 这条防的是"把 HEAD 的修法扩大到 GET 上"——那会把面板变成空白页。
+    /// （v0.8.2 起 `/` 是 302 跳转官方面板，这里用 `/static/` 验证 HTML。）
     #[tokio::test]
     async fn get_still_returns_body() {
         let (addr, _h) = spawn_dashboard().await;
-        let resp = http_req(addr, "GET", "/", Some(("u", "p"))).await;
+        let resp = http_req(addr, "GET", "/static/", Some(("u", "p"))).await;
         let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
-        assert!(!body.is_empty(), "GET / 必须有 body：{resp}");
-        assert!(body.contains("<html"), "GET / 应当是 HTML 页面");
+        assert!(!body.is_empty(), "GET /static/ 必须有 body：{resp}");
+        assert!(body.contains("<html"), "GET /static/ 应当是 HTML 页面");
     }
 
     /// ★ PT-07：只读端点**不接受 POST**，必须回 405。

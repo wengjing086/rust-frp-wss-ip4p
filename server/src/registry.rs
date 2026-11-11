@@ -89,6 +89,10 @@ pub struct Registry {
     pub client_limit: Limit,
     /// 指标收集器。
     pub observ: observability::Registry,
+    /// 按代理的流量 / 连接统计（官方面板 API 的数据源）。
+    pub stats: crate::stats::ProxyStats,
+    /// 客户端会话档案（登录 / 断开历史，`/api/clients` 的数据源）。
+    pub sessions: crate::stats::SessionTable,
     /// xtcp 打洞的牵线中心；未配置 `p2p_port` 时为 None（xtcp 自动退化成中继）。
     p2p: Mutex<Option<Arc<P2PHub>>>,
     /// VirtualNet 的转发中枢；未配置 `vnet_port` 时为 None。
@@ -143,6 +147,8 @@ impl Registry {
             conn_limit: Limit::new(limits.max_total_conns),
             client_limit: Limit::new(limits.max_clients),
             observ: observability::Registry::new(),
+            stats: crate::stats::ProxyStats::default(),
+            sessions: crate::stats::SessionTable::default(),
             p2p: Mutex::new(None),
             vnet: Mutex::new(None),
             limits,

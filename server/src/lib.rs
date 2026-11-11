@@ -19,6 +19,7 @@ pub mod ipinfo;
 pub mod limits;
 pub mod nathole_official;
 pub mod nlink;
+pub mod official_api;
 pub mod observability;
 pub mod p2p;
 pub mod pool;
@@ -26,8 +27,10 @@ pub mod registry;
 pub mod reload;
 pub mod serve;
 pub mod ssh_gateway;
+pub mod stats;
 pub mod udp_proxy;
 pub mod vhost;
+pub mod web_assets;
 pub mod visitor;
 pub mod vnet;
 

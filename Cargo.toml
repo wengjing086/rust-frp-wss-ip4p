@@ -5,7 +5,7 @@ members = ["common", "server", "client"]
 [workspace.package]
 # 本项目是「Rust-Frp 协议基座 + WSS 直连 + IP4P」的整合发行版。
 # 版本独立于上游；线协议兼容标记（frpc -v 输出）仍固定为 0.71.0，不要改。
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 rust-version = "1.75"
 authors = ["wengjing086", "nfrp contributors"]
@@ -19,7 +19,7 @@ homepage = "https://github.com/wengjing086/rust-frp-wss-ip4p"
 
 [workspace.dependencies]
 # 内部 crate
-nfrp-common = { path = "common", version = "0.8.0" }
+nfrp-common = { path = "common", version = "0.8.2" }
 
 # 外部依赖（统一在此处锁定版本，保证各 crate 一致）
 # frp v2 控制通道加密，对应官方 go 实现的 HKDF-SHA256 + AES-256-GCM

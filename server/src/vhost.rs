@@ -608,7 +608,7 @@ async fn handle_https(
     upstream.flush().await?;
     let mut visitor = visitor;
     let r = nfrp_common::util::relay_between(&mut visitor, &mut upstream).await;
-    record_bytes(&registry, &r);
+    record_bytes_for(&registry, &route.proxy_name, &r);
     if let Err(e) = r {
         debug!(%peer, sni = %nfrp_common::util::LogSafe(&sni), "HTTPS 透传中断：{e}");
     }
@@ -652,6 +652,19 @@ fn record_bytes(registry: &Registry, r: &std::io::Result<(u64, u64)>) {
     if let Ok((up, down)) = r {
         m.bytes_up.inc_by(*up);
         m.bytes_down.inc_by(*down);
+    }
+}
+
+/// 与 [`record_bytes`] 相同，额外把流量记到**按代理**的统计表
+/// （官方面板 `/api/traffic/{name}` 的数据源）。
+///
+/// 方向：`relay_between(visitor, upstream)` 的 `(up, down)` =
+/// (visitor→upstream, upstream→visitor)，官方语义
+/// TrafficIn = upstream→visitor（down）、TrafficOut = visitor→upstream（up）。
+fn record_bytes_for(registry: &Registry, proxy: &str, r: &std::io::Result<(u64, u64)>) {
+    record_bytes(registry, r);
+    if let Ok((up, down)) = r {
+        registry.stats.add_traffic(proxy, *down, *up);
     }
 }
 
@@ -936,7 +949,7 @@ async fn handle_tcpmux(
 
     let mut visitor = io.stream;
     let r = nfrp_common::util::relay_between(&mut visitor, &mut upstream).await;
-    record_bytes(&registry, &r);
+    record_bytes_for(&registry, &route.proxy_name, &r);
     if let Err(e) = r {
         debug!(%peer, %host, "tcpmux 隧道中断：{e}");
     }
@@ -1353,7 +1366,7 @@ where
 
             let mut visitor = io.stream;
             let r = nfrp_common::util::relay_between(&mut visitor, &mut upstream).await;
-            record_bytes(&registry, &r);
+            record_bytes_for(&registry, &route.proxy_name, &r);
             if let Err(e) = r {
                 debug!(%peer, "HTTP CONNECT 隧道中断：{e}");
             }

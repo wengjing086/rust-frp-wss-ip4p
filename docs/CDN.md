@@ -180,3 +180,25 @@ CDN 只负责把流量送到源站，**认证仍然是 frp 的 token**。所以�
 
 另外，CDN 侧若开了"缓存"，请把 `/ws` 这类路径设为**不缓存**，否则升级请求
 可能被缓存层挡下来。
+
+## 八、家宽无公网 IPv4：bindAddr 必须写 "::"
+
+真实案例（2026-11）：源站是家宽 + 移动宽带，没有公网 IPv4，CDN 回源走
+**IPv6 直连源站 7000 端口**（ESA 边缘节点连 `[IPv6]:7000`）。Go 版 frps 的
+`net.Listen` 默认双栈（`[::]:7000` 同时收 IPv4/IPv6），而 Rust 版默认
+`bindAddr = "0.0.0.0"` **只监听 IPv4**——于是 CDN 回源全部
+`connection_refused`，面板报 `521 Origin Down`，但局域网内直连一切正常，
+极具迷惑性。
+
+判别方法：看服务端日志，Go 版时代能看到
+`read tcp [2409:…]:7000->[240d:c010:…]:xxxx`（240d:c010 是 ESA 回源）；
+Rust 版启动日志若只写 `监听 0.0.0.0:7000` 即中招。
+
+修复：frps.toml 里把监听地址改成 IPv6 通配（Linux 默认双栈，IPv4 也能进）：
+
+```toml
+bindAddr = "::"
+```
+
+iStoreOS / OpenWrt 的 luci-app-frps：UCI 里 `frps.main.bindAddr='::'` 后
+重启服务即可（生成器白名单里有 `bindAddr`，会写进生成的 TOML）。
