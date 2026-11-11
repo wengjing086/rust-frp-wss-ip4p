@@ -1,0 +1,86 @@
+rust-frp-wss-ip4p
+Copyright 2026 wengjing086
+
+This product is licensed under the Apache License, Version 2.0.
+The full license text is in the LICENSE file accompanying this distribution,
+and is also available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+-------------------------------------------------------------------------------
+Upstream projects (attribution)
+
+This distribution is an integration of the following Apache-2.0 projects.
+Their original copyright notices are preserved here.
+
+1) NFrp / Rust-Frp -- https://github.com/Nu0vo1212/Rust-Frp
+   Copyright 2026 nfrp contributors
+   Licensed under the Apache License, Version 2.0.
+   Used as the Rust protocol base: the `common`, `server` and `client` crates
+   (frp v1/v2 wire protocol, TOML / legacy INI config compatibility, TLS,
+   WebSocket, KCP, QUIC, yamux, dashboard, ACL, etc.). Files in those crates
+   retain their original Apache-2.0 headers.
+
+2) frp-wss-ipgeo -- https://github.com/wengjing086/frp-wss-ipgeo
+   Copyright 2026 wengjing086
+   Licensed under the Apache License, Version 2.0.
+   The WSS design (sniff `GET /~!frp` AFTER TLS decryption, replay the peeked
+   bytes on mismatch) has been re-implemented in Rust in `server/src/serve.rs`.
+   No Go source code is included.
+
+3) frp-ip4p -- https://github.com/wengjing086/frp-ip4p
+   Copyright 2026 wengjing086
+   Licensed under the Apache License, Version 2.0.
+   The IP4P resolution rules (DNS TXT base64/plaintext "IP:port" -> IP4P AAAA
+   2001:0000::/16 -> fallback, override serverPort) have been re-implemented in
+   Rust in `common/src/ip4p.rs`. No Go source code is included.
+   The IP4P concept originates from hevz/frp (ip4p branch, Apache-2.0) and
+   qaz741wsd856/frp (TXT parsing, Apache-2.0).
+
+4) frp -- https://github.com/fatedier/frp
+   Copyright The frp Authors
+   Licensed under the Apache License, Version 2.0.
+   This product implements the documented frp wire protocol and accepts the frp
+   configuration file format for interoperability. No source code from that
+   project is contained in this distribution.
+
+-------------------------------------------------------------------------------
+Third-party Rust crates
+
+The project links against open-source Rust crates, predominantly under the MIT
+and/or Apache License 2.0. The authoritative, complete list with exact versions
+is in `Cargo.lock` (and the direct dependency declarations in `Cargo.toml` and
+the Cargo.toml files of the `common`, `server` and `client` crates). Notable
+direct dependencies include:
+
+  - tokio, tokio-util, futures      (MIT)
+  - quinn, quinn-proto              (MIT OR Apache-2.0)
+  - rustls, tokio-rustls, rcgen     (Apache-2.0 OR MIT / MIT)
+  - ring                            (ISC-style; see the crate's LICENSE)
+  - clap                            (MIT OR Apache-2.0)
+  - anyhow                          (MIT OR Apache-2.0)
+  - tracing, tracing-subscriber     (MIT)
+  - serde, toml, bytes, base64      (MIT OR Apache-2.0)
+  - rand, sha2, aes-gcm, hkdf, md-5 (MIT OR Apache-2.0)
+
+-------------------------------------------------------------------------------
+Changes in this distribution
+
+  - `common/src/ip4p.rs` (new): IP4P client-side endpoint resolution + cache.
+  - `common/src/dns.rs`: TXT / AAAA query support and OS DNS server discovery.
+  - `client/src/main.rs`: IP4P applied to TCP/WS/WSS/KCP/QUIC dial paths;
+    WSS now sends a standard TLS ClientHello (no frp custom first byte).
+  - `server/src/serve.rs`: second-level WebSocket probe after TLS => native
+    same-port WSS; peeked bytes are always replayed for non-WebSocket clients.
+  - `server/build.rs`, `client/build.rs`, `scripts/gen_winres.py`,
+    `assets/winres/*.res`: Windows VERSIONINFO + asInvoker manifest.
+  - Docs, CI and release workflows.
+
+The above changes are Copyright 2026 wengjing086 and licensed under the
+Apache License, Version 2.0.

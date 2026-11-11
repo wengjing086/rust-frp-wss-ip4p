@@ -1,0 +1,1971 @@
+//! 原版 frp（Go 版）TOML 配置兼容层。
+//!
+//! # 为什么需要
+//!
+//! NFrp 的目标之一是**能直接顶替原版 frpc / frps**：机器上原来跑的是
+//! `frpc -c frpc.toml`，换成 NFrp 之后最好连配置都不用改。但两边的字段名
+//! 并不一样：
+//!
+//! | 语义 | 原版 frp | nfrp |
+//! |---|---|---|
+//! | 服务端地址 | `serverAddr` / `serverPort` | `server_addr` / `server_port` |
+//! | 内网服务 | `localIP` + `localPort`（两段） | `local_addr = "ip:port"`（合并） |
+//! | 公网端口 | `remotePort` | `remote_port` |
+//! | 认证令牌 | `auth.token`（老写法 `[common] token`） | `token` |
+//! | 附加信息 | `[metadatas]`（顶层） / `[proxies.metadatas]`（代理级） | `metas` |
+//! | 带宽限流 | `[proxies.transport] bandwidthLimit` | `bandwidth_limit` |
+//! | 负载均衡 | `[proxies.loadBalancer] group` | `group` |
+//! | 健康检查 | `[proxies.healthCheck] type/path/...` | `health_check_type/...` |
+//!
+//! 照抄一份 frp 配置过来，NFrp 会在**解析阶段**直接退出，而且报错看不出
+//! 「其实是字段名不一样」：
+//!
+//! ```text
+//! Error: 读取配置 frpc.toml 失败
+//! Caused by: toml error: TOML parse error at line 8, column 1
+//!   8 | [[proxies]]
+//!     | ^^^^^^^^^^^
+//!   missing field `local_addr`
+//! ```
+//!
+//! 真实现场：NetTool 的「LoliaFRP 本地开启」会把 Lolia 平台（`api.lolia.link`）
+//! 下发的 `config` 原样写盘、再拉起 frpc。平台给的就是标准 frp 写法，所以换成
+//! NFrp 的 frpc 必然报上面这个错（原版 frpc 则一切正常）。
+//!
+//! # 做法
+//!
+//! 解析拆成两步：先把文本读成 [`toml::Value`] 这棵「值树」，把 frp 风格的键
+//! **搬到** NFrp 的键名上，再转成结构体。
+//!
+//! 唯一的原则是 **只补不覆盖**：目标键已经存在（说明写的是 NFrp 原生写法）
+//! 就保留原值。于是两种写法可以在同一份文件里混用，NFrp 自己的配置语义
+//! 完全不受影响。
+
+use toml::Value;
+
+/// 键名搬家表：`(frp 的键, NFrp 的键)`。
+type Renames = &'static [(&'static str, &'static str)];
+
+// ---------------------------------------------------------------------------
+// 基础操作
+// ---------------------------------------------------------------------------
+
+/// 在表里按 frp 的键名找出**实际存在的那个键**，匹配时折叠 ASCII 大小写。
+///
+/// 为什么必须折叠：官方 frp 读配置走的是 `toml → json → json.Unmarshal`，而 Go 的
+/// `encoding/json` 匹配字段名用的是 `strings.EqualFold`（**大小写不敏感**）。所以官方
+/// frps 对 `subDomainHost` / `subdomainHost` / `SubDomainHost` 一视同仁 ——
+/// `frps_full_example.toml` 里写的正是 `subDomainHost`（大写 D）。
+///
+/// NFrp 早期只做精确匹配，于是**官方文档里的那种拼写被当成未知键静默丢掉**：
+/// 真机对拍表现为客户端报「代理注册失败：客户端用了 subdomain，但服务端未配置
+/// subdomain_host」（见 tmp/interop_subdomain.py）。这里对齐 Go 的行为。
+///
+/// ★ 只折叠大小写，**不折叠下划线**：官方同样不把 `subdomain_host` 当成
+/// `subDomainHost`（Go 的 EqualFold 不忽略 `_`）。snake_case 是 NFrp 自己额外
+/// 容忍的写法，由 serde 的原生字段直接接住。
+fn find_key_ci(t: &toml::Table, name: &str) -> Option<String> {
+    // 精确匹配优先，保证"NFrp 原生写法优先"的语义稳定、不引入歧义
+    if t.contains_key(name) {
+        return Some(name.to_string());
+    }
+    t.keys()
+        .find(|k| k.as_str().eq_ignore_ascii_case(name))
+        .cloned()
+}
+
+/// 把 `from` 的值搬到 `to`。
+///
+/// 目标已存在时**保留目标值**（NFrp 原生写法优先），并丢弃来源键 ——
+/// 否则两套写法同时出现会让 serde 撞上 "duplicate field"。
+fn rename(t: &mut toml::Table, from: &str, to: &str) {
+    // 即使 `from == to` 也要继续：官方 Go 的 JSON/TOML 解析对键名大小写
+    // 不敏感，`PprofEnable` 与 `pprofEnable` 等价。早退会让这种写法被
+    // serde 静默忽略（字段还在，值却是默认值）。
+    let Some(actual) = find_key_ci(t, from) else {
+        return;
+    };
+    // 实际键名已经就是目标（只是大小写不同），不用搬
+    if actual == to {
+        return;
+    }
+    if t.contains_key(to) {
+        t.remove(&actual);
+        return;
+    }
+    if let Some(v) = t.remove(&actual) {
+        t.insert(to.to_string(), v);
+    }
+}
+
+/// 批量搬家。
+fn rename_all(t: &mut toml::Table, pairs: Renames) {
+    for (from, to) in pairs {
+        rename(t, from, to);
+    }
+}
+
+/// 沿 `path` 逐段下钻取一张子表。
+///
+/// 路径段同样按 [`find_key_ci`] 折叠大小写：官方 `[transport.tls]` 写
+/// `[Transport.TLS]` 也能被 Go 认下来。
+fn sub_table_at<'a>(t: &'a toml::Table, path: &[&str]) -> Option<&'a toml::Table> {
+    let first = find_key_ci(t, path.first()?)?;
+    let mut node = t.get(&first)?;
+    for seg in &path[1..] {
+        let sub = node.as_table()?;
+        let key = find_key_ci(sub, seg)?;
+        node = sub.get(&key)?;
+    }
+    node.as_table()
+}
+
+/// 沿 `path` 找到一张子表，把其中 `pairs` 列出的键搬到 `t` 上（不覆盖已有键）。
+///
+/// 用于 `[proxies.transport]` / `[proxies.healthCheck]` 这类"frp 分子表、
+/// NFrp 平铺字段"的差异。任一路径段不存在或不是表则什么都不做。
+fn hoist(t: &mut toml::Table, path: &[&str], pairs: Renames) {
+    // 先把值 clone 出来，块结束后对 t 的可变借用才不会被读取时的借用挡住
+    let picked: Vec<(&'static str, Value)> = match sub_table_at(t, path) {
+        Some(sub) => pairs
+            .iter()
+            .filter_map(|(from, to)| {
+                let k = find_key_ci(sub, from)?;
+                sub.get(&k).map(|v| (*to, v.clone()))
+            })
+            .collect(),
+        None => return,
+    };
+    for (to, v) in picked {
+        if !t.contains_key(to) {
+            t.insert(to.to_string(), v);
+        }
+    }
+}
+
+/// 与 [`hoist`] 同款，但搬运的布尔值要**取反** —— 用于 `disableCustomTLSFirstByte`
+/// 这种"frp 说禁用、NFrp 说启用"的反义键。
+fn hoist_inverted_bool(t: &mut toml::Table, path: &[&str], from: &str, to: &str) {
+    let v = sub_table_at(t, path)
+        .and_then(|sub| find_key_ci(sub, from).and_then(|k| sub.get(&k)))
+        .and_then(|v| v.as_bool());
+    if let Some(b) = v {
+        if !t.contains_key(to) {
+            t.insert(to.to_string(), Value::Boolean(!b));
+        }
+    }
+}
+
+/// 遍历根表下某个数组表（`[[proxies]]` / `[[visitors]]`）里的每条记录。
+fn for_each_record(root: &mut toml::Value, key: &str, f: impl Fn(&mut toml::Table)) {
+    let Some(t) = root.as_table() else {
+        return;
+    };
+    let Some(actual) = find_key_ci(t, key) else {
+        return;
+    };
+    let Some(Value::Array(items)) = root.get_mut(&actual) else {
+        return;
+    };
+    for item in items.iter_mut() {
+        if let Value::Table(t) = item {
+            f(t);
+        }
+    }
+}
+
+/// 把整数或数字字符串统一成端口号的十进制写法。
+fn port_text(v: &Value) -> Option<String> {
+    if let Some(i) = v.as_integer() {
+        return Some(i.to_string());
+    }
+    v.as_str().map(|s| s.trim().to_string())
+}
+
+/// IPv6 字面量必须带方括号，否则 `::1` + `22` 拼出来的 `::1:22` 没法解析。
+fn bracket_if_v6(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    }
+}
+
+/// `localIP` + `localPort` 两段式 → NFrp 的 `local_addr = "ip:port"` 合并式。
+///
+/// 只补不覆盖：`local_addr` 已经写了就原样保留（顺手清掉那两个 frp 键，免得留冗余）。
+fn merge_local_addr(p: &mut toml::Table) {
+    if p.contains_key("local_addr") {
+        p.remove("local_ip");
+        p.remove("local_port");
+        return;
+    }
+    let ip = p.remove("local_ip");
+    let port = p.remove("local_port");
+
+    let addr = match (ip, port) {
+        (Some(ip_v), Some(port_v)) => {
+            let host = ip_v.as_str().unwrap_or("").trim().to_string();
+            match port_text(&port_v) {
+                Some(pt) if host.is_empty() => format!("127.0.0.1:{}", pt),
+                Some(pt) => format!("{}:{}", bracket_if_v6(&host), pt),
+                None if !host.is_empty() => host,
+                None => return,
+            }
+        }
+        // 只给 localIP：原样留着当地址，让下游解析给出明确的错误
+        (Some(ip_v), None) => match ip_v.as_str() {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => return,
+        },
+        // frp 的 localIP/localPort 都带默认值，可以全省略 —— 那种写法只在插件
+        // 代理上成立（插件本身就是本地服务）。按 frp 的默认值补齐，免得用户从
+        // frp 搬过来的插件配置直接死在 "missing field local_addr" 上。
+        (None, None) => {
+            if p.contains_key("plugin") {
+                "127.0.0.1:0".to_string()
+            } else {
+                return;
+            }
+        }
+        (None, Some(port_v)) => match port_text(&port_v) {
+            Some(pt) => format!("127.0.0.1:{}", pt),
+            None => return,
+        },
+    };
+
+    p.insert("local_addr".to_string(), Value::String(addr));
+}
+
+// ---------------------------------------------------------------------------
+// 客户端
+// ---------------------------------------------------------------------------
+
+/// 官方 frp **支持**、但 nfrp **未实现**的配置字段。
+///
+/// # 为什么要有这个清单
+///
+/// 官方 frpc 的解析默认 `--strict-config=true`（见 `frpc --help`）：**未知字段直接
+/// 报错**。NFrp 的 serde 不拒绝未知字段，于是用户照官方文档写
+/// `useEncryption = true` 会被**静默吞掉** —— 他以为流量加密了，实际走的是明文，
+/// 日志里一个字都不说。这比"解析报错"危险得多（报错至少会让人来查），
+/// 所以这里把它们挑出来，交给启动日志明说"这一项没生效"。
+///
+/// # 维护规则（重要）
+///
+/// **只放"官方 0.71 确认支持、且 NFrp 确实没实现"的字段**，实现后删掉。
+/// 判定方法：拿官方 `frpc verify -c <配置>` 逐个测（默认 strict，未知字段会报错）。
+///
+/// 不要凭印象往里加 —— 实测证明官方 0.71 **没有** `loginFailExitDelay` /
+/// `loginRetryInterval` / `multiplexMaxStreams` / `multiplexMaxConns` /
+/// `tunnelProxy` / `udpMultiplexer` 这些字段（verify 直接回 `unknown field`）。
+/// 把它们列进来，会让用户以为"官方有而 NFrp 缺"，实际是两边都没有。
+const UNSUPPORTED_CLIENT_FIELDS: &[&str] = &[
+    // v0.6.6：官方 0.71 的客户端顶层 / 代理 / visitor 字段已全部落地。
+    // useEncryption、useCompression、proxyURL、tokenSource、udpPacketSize、
+    // natHoleStunServer、dnsServer、includes、pprofEnable、assetsDir 均已在
+    // 配置层与实际执行路径接通。
+];
+
+/// 扫描一份配置里出现的、[`UNSUPPORTED_CLIENT_FIELDS`] 中的字段名。
+///
+/// 只按**键名**匹配、不看层级：这些名字在官方配置里都是唯一的，
+/// 按层级匹配反而会因写法差异（`[proxies.transport] useEncryption` 与
+/// 顶层写法）而漏掉。返回去重排序后的字段名。
+pub fn unsupported_fields(root: &Value) -> Vec<String> {
+    let mut found = Vec::new();
+    collect_unsupported(root, &mut found);
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// 官方 frps **支持**、但 nfrp **未实现**的服务端配置字段。
+///
+/// 与 [`UNSUPPORTED_CLIENT_FIELDS`] 同样的道理：`ServerConfig` 的 serde 不拒绝
+/// 未知字段，官方 frps 配置里的这些项会被**静默忽略** —— 其中 `tokenSource`
+/// （从外部源取 token）、`sshTunnelGateway` / `httpPlugins`（都能开新入口）
+/// 都属于"配了不生效"会让人误判的那类，尤其值得留意。
+///
+/// 维护规则同客户端清单：只放"官方 0.71 确认支持、且 NFrp 确实没实现"的，
+/// 实现后删掉。清单按官方 `frps_full_example.toml`（v0.71.0）逐项比对得出。
+const UNSUPPORTED_SERVER_FIELDS: &[&str] = &[
+    // v0.6.6：官方 0.71 的 frps 顶层字段已全部落地。
+    // pprofEnable、natholeAnalysisDataReserveHours、sshTunnelGateway、
+    // httpPlugins 均已在配置层与执行路径接通。
+    // 唯一仍单独检测的是 `webServer.tls.*`（面板 HTTPS），见下方路径扫描。
+];
+
+/// 从 **legacy INI 原文**里扫未实现字段（返回出现的原始键名）。
+///
+/// INI 不能复用 [`unsupported_fields`]：`frp_legacy::legacy_client_to_value`
+/// 只把 nfrp **认识**的键搬进 `toml::Value`，不认识的当场丢掉 ——
+/// 扫"转换后的 value"必然一个都扫不到。所以只能读原文。
+pub fn unsupported_fields_ini(text: &str) -> Vec<String> {
+    scan_ini_keys(text, UNSUPPORTED_CLIENT_FIELDS)
+}
+
+/// 扫描一份**服务端**配置里出现的、[`UNSUPPORTED_SERVER_FIELDS`] 中的字段名。
+pub fn unsupported_server_fields(root: &Value) -> Vec<String> {
+    let mut found = Vec::new();
+    collect_named(root, UNSUPPORTED_SERVER_FIELDS, &mut found);
+    // 注意：`webServer.tls.certFile` / `keyFile` 已实现（面板 HTTPS），
+    // 不能再按路径补扫成“未实现”告警 —— 否则启动日志会和实际行为矛盾。
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// 扫描一份**服务端 legacy INI 原文**里的未实现字段。
+pub fn unsupported_server_fields_ini(text: &str) -> Vec<String> {
+    scan_ini_keys(text, UNSUPPORTED_SERVER_FIELDS)
+}
+
+/// 按给定清单递归收集键名。
+fn collect_named(v: &Value, list: &[&str], out: &mut Vec<String>) {
+    match v {
+        Value::Table(t) => {
+            for (k, val) in t {
+                if list.iter().any(|f| field_matches(f, k)) {
+                    out.push(k.clone());
+                }
+                collect_named(val, list, out);
+            }
+        }
+        Value::Array(a) => {
+            for item in a {
+                collect_named(item, list, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 清单里的字段名与配置里读到的键名是否指同一个东西。
+///
+/// 三种写法都要认：TOML 的 camelCase（`allowPorts`）、官方 legacy INI 的
+/// snake_case（`allow_ports` / `use_encryption`），以及**任意大小写变体** ——
+/// 官方 frp 走 Go 的 `encoding/json`，字段匹配是按大小写折叠的（`strings.EqualFold`），
+/// 所以 `AllowPorts` 在官方那边照样算数，NFrp 的"未实现字段"提示也得跟上。
+fn field_matches(f: &str, k: &str) -> bool {
+    f == k
+        || camel_to_snake(f) == k
+        || f.eq_ignore_ascii_case(k)
+        || camel_to_snake(f).eq_ignore_ascii_case(k)
+}
+
+/// 在 legacy INI 原文里找给定清单中的键名（INI 用 snake_case）。
+fn scan_ini_keys(text: &str, list: &[&str]) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with(';')
+            || line.starts_with('#')
+            || line.starts_with('[')
+        {
+            continue;
+        }
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if list.iter().any(|f| field_matches(f, key)) {
+            found.push(key.to_string());
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// 客户端版：直接按 [`UNSUPPORTED_CLIENT_FIELDS`] 递归收集。
+fn collect_unsupported(v: &Value, out: &mut Vec<String>) {
+    collect_named(v, UNSUPPORTED_CLIENT_FIELDS, out);
+}
+
+/// `useEncryption` → `use_encryption`（清单按 TOML 的 camelCase 维护，
+/// 这里换成官方 legacy INI 的 snake_case 形式一起比对）。
+fn camel_to_snake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 客户端配置的顶层键名映射。
+const CLIENT_TOP: Renames = &[
+    ("serverAddr", "server_addr"),
+    ("serverPort", "server_port"),
+    ("serverWorkPort", "server_work_port"),
+    ("clientID", "client_id"),
+    ("clientId", "client_id"),
+    ("logLevel", "log_level"),
+    ("transportProtocol", "transport_protocol"),
+    ("heartbeatInterval", "heartbeat_interval"),
+    ("heartbeatTimeout", "heartbeat_timeout"),
+    ("reconnectInterval", "reconnect_interval"),
+    ("loginFailExit", "login_fail_exit"),
+    ("poolCount", "pool_count"),
+    ("tcpMux", "tcp_mux"),
+    ("p2pPort", "p2p_port"),
+    ("p2pEnable", "p2p_enable"),
+];
+
+/// `[[proxies]]` 一条记录里的键名映射。
+const PROXY_FIELDS: Renames = &[
+    ("localIP", "local_ip"),
+    ("localPort", "local_port"),
+    ("remotePort", "remote_port"),
+    ("customDomains", "custom_domains"),
+    ("httpUser", "http_user"),
+    ("httpPwd", "http_pwd"),
+    ("httpPassword", "http_pwd"),
+    ("hostHeaderRewrite", "host_header_rewrite"),
+    ("secretKey", "secret_key"),
+    ("allowUsers", "allow_users"),
+    // tcpmux：`multiplexer` 两边同名，但官方是 camelCase 小写开头、TEngine 那种
+    // 平台偶尔会写成 `multiplexer`/`Multiplexer` 两种；走搬家表就能统一折叠。
+    ("multiplexer", "multiplexer"),
+    ("routeByHTTPUser", "route_by_http_user"),
+];
+
+/// `[[visitors]]` 一条记录里的键名映射。
+const VISITOR_FIELDS: Renames = &[
+    ("serverName", "server_name"),
+    ("bindAddr", "bind_addr"),
+    ("bindPort", "bind_port"),
+];
+
+/// frp 用 `[proxies.plugin]` **子表**描述客户端插件，NFrp 却用平铺的
+/// `plugin` **字符串**字段 —— 键名正好撞车，所以不能走 [`hoist`]（目标键已存在
+/// 会被判成"保留原生值"而跳过）。这里单独处理：先把子表整个摘下来，再逐键提上去。
+fn extract_plugin(p: &mut toml::Table) {
+    // 原生写法（`plugin = "socks5"` 已是字符串）就什么都不做
+    let Some(actual) = find_key_ci(p, "plugin") else {
+        return;
+    };
+    if !matches!(p.get(&actual), Some(Value::Table(_))) {
+        return;
+    }
+    let Some(Value::Table(mut sub)) = p.remove(&actual) else {
+        return;
+    };
+    let pairs: Renames = &[
+        ("type", "plugin"),
+        // 官方 `static_file` 用的是 `localPath`，`unix_domain_socket` 用的是 `unixPath`，
+        // 两者在 NFrp 里是同一个字段 —— 漏了 `unixPath` 会让一份合法的官方配置
+        // 报"必须配置 plugin_local_path"，而用户明明配了。
+        ("localPath", "plugin_local_path"),
+        ("unixPath", "plugin_local_path"),
+        ("stripPrefix", "plugin_strip_prefix"),
+        ("username", "plugin_user"),
+        ("httpUser", "plugin_user"),
+        ("password", "plugin_passwd"),
+        ("httpPassword", "plugin_passwd"),
+        ("localAddr", "plugin_local_addr"),
+        ("crtPath", "plugin_crt_path"),
+        ("keyPath", "plugin_key_path"),
+        ("hostHeaderRewrite", "plugin_host_header_rewrite"),
+    ];
+    for (from, to) in pairs {
+        // ★ v0.5.4 修（L8）：用**大小写折叠**查找，而不是精确匹配。
+        //
+        // 官方 frp 读配置走 `toml → json → json.Unmarshal`，Go 的
+        // `encoding/json` 匹配字段名用 `strings.EqualFold` —— 即 `localPath`
+        // 与 `LOCALPATH` 官方都认。而这里原来是 `sub.remove(*from)` 精确匹配，
+        // 于是官方能用的 `LocalPath` / `LOCALPATH` 被 NFrp **静默丢弃**，
+        // 随后报"必须配置 plugin_local_path" —— 用户明明配了却被告知没配。
+        //
+        // 定级说明：后果是 **fail-closed** 的（必填缺失 ⇒ 明确报错），
+        // 不构成安全漏洞；但与模块文档"对齐 Go 的 EqualFold"的承诺不符，
+        // 而且错误提示会误导人。
+        //
+        // ★ 已核实不存在反向风险：大小写折叠只影响"能不能找到这个键"，
+        //   不会把危险字段偷渡进 `validate_remote_proxy`
+        //   （那个函数读的是规范化后的结构体字段；远程下发路径不经过本兼容层）。
+        let key = sub.keys().find(|k| k.eq_ignore_ascii_case(from)).cloned();
+        if let Some(k) = key {
+            if let Some(v) = sub.remove(&k) {
+                if !p.contains_key(*to) {
+                    p.insert((*to).to_string(), v);
+                }
+            }
+        }
+    }
+
+    // `requestHeaders` 在官方是 `{ set = { "K" = "V" } }`，NFrp 只要里面那张 `set` 表。
+    // 官方 `HeaderOperations` 目前只有 `set` 一个字段，但**不能假定**它永远只有它 ——
+    // 所以只取 `set`，遇到别的字段就当没配（而不是把整张表塞进字符串 map 里炸掉）。
+    if let Some(Value::Table(mut rh)) = sub.remove("requestHeaders") {
+        if let Some(set @ Value::Table(_)) = rh.remove("set") {
+            if !p.contains_key("plugin_request_headers") {
+                p.insert("plugin_request_headers".to_string(), set);
+            }
+        }
+    }
+}
+
+/// 把一份客户端配置的键名从 frp 风格规范化成 NFrp 风格（原地修改）。
+pub fn normalize_client(root: &mut toml::Value) {
+    let Some(t) = root.as_table_mut() else {
+        return;
+    };
+
+    rename_all(t, CLIENT_TOP);
+
+    // `[transport]`：frp 把多路复用 / 心跳 / 传输协议都塞在这里，NFrp 是平铺字段
+    hoist(
+        t,
+        &["transport"],
+        &[
+            ("poolCount", "pool_count"),
+            ("tcpMux", "tcp_mux"),
+            ("protocol", "transport_protocol"),
+            // frp 的线协议版本（`"v1"` / `"v2"`，默认 `"v1"`）。
+            // NFrp 里就叫 `protocol`，取值也兼容 `"v1"` / `"v2"` 的裸写法。
+            ("wireProtocol", "protocol"),
+            ("heartbeatInterval", "heartbeat_interval"),
+            ("heartbeatTimeout", "heartbeat_timeout"),
+            // 连接服务端的超时 / 本机出口绑定（限制①批次1 实现，语义对齐官方
+            // `connector.go`：仅走 TCP 拨号路径，KCP 不适用）。
+            ("dialServerTimeout", "dial_server_timeout"),
+            ("connectServerLocalIP", "connect_server_local_ip"),
+            // TCP keepalive / yamux 保活（限制①批次2 实现，官方同名键，
+            // 语义与落法见 config.rs 对应字段的文档）。
+            ("dialServerKeepalive", "dial_server_keepalive"),
+            ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
+            // ★ v0.6.6：数据面加密/压缩、出站代理、自定义 DNS。
+            // 官方 GetRealConn 读的是 pxy.baseCfg.Transport.*（客户端级），
+            // 所以这几项必须从 [transport] 提升到顶层，否则配了也不生效。
+            ("useEncryption", "useEncryption"),
+            ("useCompression", "useCompression"),
+            ("proxyURL", "proxyURL"),
+            ("dnsServer", "dnsServer"),
+            ("natHoleStunServer", "natHoleStunServer"),
+        ],
+    );
+    hoist(
+        t,
+        &["transport", "tls"],
+        &[
+            ("enable", "tls_enable"),
+            ("serverName", "tls_server_name"),
+            // 限制①批次3：mTLS / 自定义证书。官方把这几项放在
+            // `[transport.tls]`，NFrp 结构体是平铺字段，必须 hoist 才生效。
+            // 目标键保持官方 camelCase —— 结构体字段带 `rename`，serde 认的是它。
+            ("trustedCaFile", "trustedCaFile"),
+            ("certFile", "certFile"),
+            ("keyFile", "keyFile"),
+        ],
+    );
+    hoist_inverted_bool(
+        t,
+        &["transport", "tls"],
+        "disableCustomTLSFirstByte",
+        "tls_custom_first_byte",
+    );
+
+    // 认证令牌：frp 新写法 `auth.token`，老写法 `[common] token`。
+    // NFrp 只有顶层 `token` 一个。
+    hoist(t, &["auth"], &[("token", "token")]);
+
+    // `[metadatas]` 要**整表透传**（→ `metas` → `Login.metas`）：LoliaFRP 这类
+    // 平台就是靠 `metas["token"]` 认出隧道的，丢了它服务端只会回一句
+    // 「FRPC 配置文件错误」。
+    //
+    // 注意这是**顶层**的 `[metadatas]`，只进登录消息；`[[proxies]]` 里那份
+    // `[proxies.metadatas]` 是另一回事（进 `NewProxy.metas`），在下面单独搬。
+    //
+    // ★ 千万别顺手把 `metadatas.token` 当成本地认证 token —— 实测反过来：
+    //   frp 里 `metadatas` 只是"随消息带过去的附加信息"，**不参与认证**。
+    //   平台给的这份配置没有 `auth.token`，服务端的全局 token 也是空的，
+    //   于是官方 frpc 发的是 `md5("" + timestamp)`。我们若拿 `metadatas.token`
+    //   去算 privilege_key，服务端会直接回
+    //   「token in login doesn't match token from configuration」。
+    rename(t, "metadatas", "metas");
+
+    // 日志：`[log] level` 与顶层 `logLevel` 等价；`to` / `maxDays` /
+    // `disablePrintColor` 只在 `[log]` 里。
+    hoist(
+        t,
+        &["log"],
+        &[
+            ("level", "log_level"),
+            ("to", "log_to"),
+            ("maxDays", "max_days"),
+            ("disablePrintColor", "disable_print_color"),
+        ],
+    );
+
+    for_each_record(root, "proxies", |p| {
+        rename_all(p, PROXY_FIELDS);
+
+        hoist(
+            p,
+            &["transport"],
+            &[
+                ("bandwidthLimit", "bandwidth_limit"),
+                ("bandwidthLimitMode", "bandwidth_limit_mode"),
+                // ★ v0.6.6：数据面加密/压缩在官方的 [proxies.transport] 段里
+                ("useEncryption", "use_encryption"),
+                ("useCompression", "use_compression"),
+            ],
+        );
+        hoist(
+            p,
+            &["loadBalancer"],
+            &[("group", "group"), ("groupKey", "group_key")],
+        );
+        hoist(
+            p,
+            &["healthCheck"],
+            &[
+                ("type", "health_check_type"),
+                ("timeoutSeconds", "health_check_timeout_s"),
+                ("maxFailed", "health_check_max_failed"),
+                ("intervalSeconds", "health_check_interval_s"),
+                ("path", "health_check_url"),
+                // ★ v0.6.3：官方 `healthCheck.httpHeaders` ——
+                //   `[{ name = "Authorization", value = "Bearer x" }]`
+                //   整个数组搬过来，serde 按 `Vec<HttpHeader>` 解析。
+                ("httpHeaders", "health_check_http_headers"),
+            ],
+        );
+
+        extract_plugin(p);
+
+        // 代理级 `[proxies.metadatas]` → `metas`（会随 `NewProxy` 上报）。
+        // 注意这和顶层的 `[metadatas]`（→ `Login.metas`）是两份东西，
+        // 官方 frpc 也是分开的：顶层进 `Login.Metas`，这一份进 `NewProxy.Metas`。
+        rename(p, "metadatas", "metas");
+
+        merge_local_addr(p);
+    });
+
+    for_each_record(root, "visitors", |v| {
+        rename_all(v, VISITOR_FIELDS);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 服务端
+// ---------------------------------------------------------------------------
+
+/// 服务端配置的顶层键名映射。
+const SERVER_TOP: Renames = &[
+    ("bindAddr", "bind_addr"),
+    ("bindPort", "bind_port"),
+    ("logLevel", "log_level"),
+    ("vhostHTTPPort", "vhost_http_port"),
+    ("vhostHTTPSPort", "vhost_https_port"),
+    // tcpmux：官方 frps.toml 里是 camelCase，NFrp 里是 snake_case。
+    // ★ 少这一行就会**静默忽略** —— 用户配了 tcpmuxHTTPConnectPort 却启动不了
+    //   CONNECT 复用器，然后 tcpmux 代理一条都注册不上，报错还指向代理而不是配置。
+    ("tcpmuxHTTPConnectPort", "tcpmux_http_connect_port"),
+    ("tcpmuxPassthrough", "tcpmux_passthrough"),
+    // 虚拟主机 / 端口管控（官方 frps.toml 里都是顶层 camelCase）
+    ("vhostHTTPTimeout", "vhost_http_timeout"),
+    ("custom404Page", "custom_404_page"),
+    // ★ 安全相关：少了这两行，"端口白名单 + 单客户端端口数上限"会**静默失效** ——
+    //   用户以为锁住了 22 / 3306，实际任何客户端都能申请。
+    ("allowPorts", "allow_ports"),
+    ("maxPortsPerClient", "max_ports_per_client"),
+    ("detailedErrorsToClient", "detailed_errors_to_client"),
+    ("subdomainHost", "subdomain_host"),
+    ("transportProtocol", "transport_protocol"),
+    // 限制①批次1：数据面监听地址与"等用户连接配工作连接"的超时（官方顶层键）。
+    ("proxyBindAddr", "proxy_bind_addr"),
+    ("userConnTimeout", "user_conn_timeout"),
+    // 官方 0.71 新增的顶层键（serde 里已经是 camelCase，这里只是为了
+    // 折叠大小写：`PprofEnable` / `SSHTunnelGateway` 也要能读）。
+    ("assetsDir", "assetsDir"),
+    ("pprofEnable", "pprofEnable"),
+    (
+        "natholeAnalysisDataReserveHours",
+        "natholeAnalysisDataReserveHours",
+    ),
+    ("httpPlugins", "httpPlugins"),
+    ("sshTunnelGateway", "sshTunnelGateway"),
+];
+
+/// 把一份服务端配置的键名从 frp 风格规范化成 NFrp 风格（原地修改）。
+pub fn normalize_server(root: &mut toml::Value) {
+    let Some(t) = root.as_table_mut() else {
+        return;
+    };
+
+    rename_all(t, SERVER_TOP);
+
+    // frp 的 `bindPort` 表示"控制连接与工作连接共用同一个端口"，NFrp 用
+    // `bind_port` 表示同一件事；另外还认一下更老的 `controlPort`。
+    if !t.contains_key("bind_port") {
+        if let Some(v) = t.remove("controlPort") {
+            t.insert("bind_port".to_string(), v);
+        }
+    }
+
+    hoist(
+        t,
+        &["transport"],
+        &[
+            ("tcpMux", "tcp_mux"),
+            ("protocol", "transport_protocol"),
+            // frp 的线协议版本。服务端**按魔术字自动识别**对端走 v1 还是 v2
+            // （与官方 frps 的 `wire.CheckMagic` 一致），这一项只是为了
+            // "原版 frps 配置能直接喂进来"而接受它。
+            ("wireProtocol", "protocol"),
+            ("heartbeatTimeout", "heartbeat_timeout"),
+            // 空闲工作连接池上限（限制①批次1 实现；官方默认 5，nfrp 默认 0 = 不限）。
+            ("maxPoolCount", "max_pool_count"),
+            // yamux 保活间隔 + 主端口 TCP keepalive（限制①批次2 实现）。
+            ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
+            ("tcpKeepalive", "tcp_keepalive"),
+        ],
+    );
+    hoist(
+        t,
+        &["transport", "tls"],
+        &[
+            ("force", "tls_force"),
+            // 限制①批次3：服务端自定义证书 + mTLS。
+            ("certFile", "certFile"),
+            ("keyFile", "keyFile"),
+            ("trustedCaFile", "trustedCaFile"),
+        ],
+    );
+
+    hoist(t, &["auth"], &[("token", "token")]);
+    hoist(
+        t,
+        &["log"],
+        &[
+            ("level", "log_level"),
+            ("to", "log_to"),
+            ("maxDays", "max_days"),
+            ("disablePrintColor", "disable_print_color"),
+        ],
+    );
+
+    // 内置面板：frp 放在 `[webServer]`
+    hoist(
+        t,
+        &["webServer"],
+        &[
+            ("port", "dashboard_port"),
+            ("user", "dashboard_user"),
+            ("password", "dashboard_pwd"),
+            // 官方把静态资源与 pprof 开关也放在 [webServer] 下。
+            // 少这两行会静默忽略：用户以为开了 pprof / 换了面板，
+            // 实际一个字节都没变。
+            ("assetsDir", "assetsDir"),
+            ("pprofEnable", "pprofEnable"),
+        ],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CLIENT_TOP, PROXY_FIELDS, UNSUPPORTED_CLIENT_FIELDS, UNSUPPORTED_SERVER_FIELDS,
+        VISITOR_FIELDS,
+    };
+    use crate::config::{parse_client_toml, parse_server_toml};
+
+    // ---- UNSUPPORTED_CLIENT_FIELDS：官方有、NFrp 没实现的字段 ----
+
+    /// 清单里的字段**必须**是 NFrp 真没实现的：一旦某个名字被加进搬家表
+    /// （说明开始支持了），这里就红，提醒把它从清单里删掉 —— 否则会给出
+    /// 错误的"未实现"提示，比不提示更误导。
+    #[test]
+    fn 未实现字段清单不得与已支持字段重叠() {
+        let known: Vec<&str> = CLIENT_TOP
+            .iter()
+            .chain(PROXY_FIELDS)
+            .chain(VISITOR_FIELDS)
+            .map(|(frp, _)| *frp)
+            .collect();
+        for f in UNSUPPORTED_CLIENT_FIELDS {
+            assert!(
+                !known.contains(f),
+                "{f} 已进搬家表（说明已支持），请从 UNSUPPORTED_CLIENT_FIELDS 删掉"
+            );
+        }
+    }
+
+    /// `useEncryption` / `useCompression` 是最要紧的两个：用户以为加密了，
+    /// 实际是明文。TOML 的 camelCase 写法必须能识别出来。
+    #[test]
+    fn tom_里_use_encryption_已经实现所以不再报未实现() {
+        // ★ v0.6.6：`useEncryption` / `useCompression` 已经真正实现了
+        // （数据面 AES-128-CFB + Snappy framing），所以它们**不该**再出现在
+        // "未实现字段"清单里 —— 否则会出现"说没实现而实际能用"的反向假警报。
+        let raw = r#"
+serverAddr = "127.0.0.1"
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+[proxies.transport]
+useEncryption = true
+useCompression = true
+"#;
+        let cfg = parse_client_toml(raw).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "实现之后不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        // 值要真的落到配置里
+        assert!(cfg.proxies[0].use_encryption, "useEncryption 要读进来");
+        assert!(cfg.proxies[0].use_compression, "useCompression 要读进来");
+    }
+
+    /// 官方 legacy INI 用的是 snake_case（`use_encryption`），也要认。
+    #[test]
+    fn ini_里_use_encryption_已经实现所以不再报未实现() {
+        // legacy INI 同理：`use_encryption` 现在会真的生效。
+        let raw = "\n[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n\n\
+[ssh]\ntype = tcp\nlocal_ip = 127.0.0.1\nlocal_port = 22\nremote_port = 6000\n\
+use_encryption = true\nuse_compression = true\n";
+        let cfg = crate::config::parse_client(raw).unwrap();
+        assert!(
+            !cfg.unsupported_fields
+                .contains(&"use_encryption".to_string()),
+            "实现之后不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+    }
+
+    /// **已支持**的字段不能被误报。`poolCount` 是搬家里有的（→ `pool_count`），
+    /// 上一轮排查就因为"没报错就算忽略"把它误判成缺失了。
+    #[test]
+    fn 已支持字段不得被误报() {
+        let raw = r#"
+serverAddr = "127.0.0.1"
+poolCount = 4
+heartbeatInterval = 30
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+secretKey = "sk"
+"#;
+        let cfg = parse_client_toml(raw).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "已支持的配置不该报未实现字段，实际：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.pool_count, 4);
+        assert_eq!(cfg.heartbeat_interval, 30);
+    }
+
+    // ---- UNSUPPORTED_SERVER_FIELDS：官方 frps 有、NFrp 没实现的服务端字段 ----
+
+    /// 与客户端同理：清单里的名字一旦进了搬家表（说明开始支持了）这里就红。
+    #[test]
+    fn 未实现服务端字段清单不得与已支持字段重叠() {
+        for (frp, _) in super::SERVER_TOP {
+            assert!(
+                !UNSUPPORTED_SERVER_FIELDS.contains(frp),
+                "{frp} 已进搬家表（说明已支持），请从 UNSUPPORTED_SERVER_FIELDS 删掉"
+            );
+        }
+    }
+
+    /// `allowPorts` / `maxPortsPerClient` 是**安全相关**：配了不生效比不配更危险
+    /// （管理员以为端口被限制住了，实际全放开）。TOML camelCase 必须真读进来。
+    #[test]
+    fn 服务端的_allow_ports_与_max_ports_per_client_能读进来() {
+        let raw = r#"
+bindPort = 7000
+allowPorts = [
+  { start = 2000, end = 3000 },
+  { single = 3001 },
+]
+maxPortsPerClient = 20
+"#;
+        let cfg = parse_server_toml(raw).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "这两项已经实现，不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.allow_ports.len(), 2);
+        assert_eq!(cfg.allow_ports[0].to_string(), "2000-3000");
+        assert_eq!(cfg.allow_ports[1].to_string(), "3001");
+        assert!(cfg.port_allowed(2500));
+        assert!(cfg.port_allowed(3001));
+        assert!(!cfg.port_allowed(3002), "名单外的端口必须被拒");
+        assert!(!cfg.port_allowed(22), "22 不能被放行");
+        assert_eq!(cfg.max_ports_per_client, 20);
+    }
+
+    /// 官方 frps_full_example 里的字符串写法（legacy `--allow_ports` 的形式）也要认。
+    #[test]
+    fn 服务端的_allow_ports_也认字符串写法() {
+        let raw = r#"
+bindPort = 7000
+allowPorts = ["20000-30000", "8443"]
+"#;
+        let cfg = parse_server_toml(raw).unwrap();
+        assert_eq!(
+            crate::config::format_port_ranges(&cfg.allow_ports),
+            "20000-30000,8443"
+        );
+        assert!(cfg.port_allowed(20000));
+        assert!(cfg.port_allowed(8443));
+        assert!(!cfg.port_allowed(8442));
+    }
+
+    /// 空名单 = 不限制（与官方 `ports.Manager` 一致），不能变成"全禁止"。
+    #[test]
+    fn 未配_allow_ports_等于不限制() {
+        let cfg = parse_server_toml("bindPort = 7000").unwrap();
+        assert!(cfg.allow_ports.is_empty());
+        assert!(cfg.port_allowed(22));
+        assert!(cfg.port_allowed(65535));
+    }
+
+    /// 官方 legacy INI 用 snake_case + 逗号串，且必须真的搬过 allow_ports
+    /// （INI 转换器只搬认识的键）。
+    #[test]
+    fn ini能搬服务端的_allow_ports_与端口上限() {
+        let raw = r#"
+[common]
+bind_port = 7000
+allow_ports = 2000-3000,3001
+max_ports_per_client = 20
+vhost_http_timeout = 30
+detailed_errors_to_client = false
+log_file = /var/log/frps.log
+log_max_days = 7
+"#;
+        let cfg = crate::config::parse_server(raw).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "已实现的字段不该报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(
+            crate::config::format_port_ranges(&cfg.allow_ports),
+            "2000-3000,3001"
+        );
+        assert_eq!(cfg.max_ports_per_client, 20);
+        assert_eq!(cfg.vhost_http_timeout, 30);
+        assert!(!cfg.detailed_errors_to_client);
+        assert_eq!(cfg.log_to, "/var/log/frps.log");
+        assert_eq!(cfg.max_days, 7);
+    }
+
+    /// ★ 写错的 `allow_ports` 必须报错，不能静默变成"不限制"。
+    /// 官方 INI 转换器把解析错误吞掉 → AllowPorts 为空 → **全端口放开**，
+    /// 这是"配了安全策略却等于没配"的经典翻车现场。
+    #[test]
+    fn ini里写错的_allow_ports_要报错而不是放开全部() {
+        let raw = "[common]\nbind_port = 7000\nallow_ports = 3000-2000\n";
+        let err = crate::config::parse_server(raw).unwrap_err().to_string();
+        assert!(err.contains("allow_ports"), "错误里要点名字段：{err}");
+    }
+
+    /// 已实现的服务端字段不能被误报。`bindPort` / `logLevel` 都在搬家表里。
+    #[test]
+    fn 已实现服务端字段不得被误报() {
+        let raw = r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+logLevel = "info"
+transportProtocol = "tcp"
+"#;
+        let cfg = parse_server_toml(raw).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "已支持的服务端配置不该报未实现字段，实际：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.frp_bind_port(), 7000);
+    }
+
+    /// LoliaFRP 平台真实下发的配置（`GET /user/frpc/config`，Base64 解出来的原文）。
+    /// 这份就是线上报 `missing field local_addr` 的那一份，一字未改。
+    const LOLIA_FRPC: &str = r#"
+serverAddr = 'cn-hz-2.qwq.fan'
+serverPort = 30000
+user = '2569'
+
+[metadatas]
+token = 'x8p5mo0u8ips3lmohc67r58mejp7uthf'
+
+[[proxies]]
+name = 'c0462d9ce7e44bce97e626c4ae880905'
+type = 'tcp'
+localIP = '127.0.0.1'
+localPort = 25565
+remotePort = 38725
+
+[proxies.transport]
+bandwidthLimit = '25MB'
+bandwidthLimitMode = 'server'
+"#;
+
+    #[test]
+    fn 原版_frp_配置应当可以直接解析() {
+        let cfg = parse_client_toml(LOLIA_FRPC).unwrap();
+
+        assert_eq!(cfg.server_addr, "cn-hz-2.qwq.fan");
+        assert_eq!(cfg.server_port, 30000);
+        assert_eq!(cfg.user, "2569");
+        // `[metadatas]` 里的 token 不是认证 token（frp 语义：它只随消息带给服务端）
+        assert!(cfg.token.is_empty(), "metadatas.token 不该被当成认证 token");
+        // ★ 关键：`[metadatas]` 必须原样进 Login.metas / NewProxy.metas，
+        //   否则服务端认不出隧道，只会回「FRPC 配置文件错误」
+        assert_eq!(
+            cfg.metas.get("token").map(String::as_str),
+            Some("x8p5mo0u8ips3lmohc67r58mejp7uthf")
+        );
+
+        assert_eq!(cfg.proxies.len(), 1);
+        let p = &cfg.proxies[0];
+        assert_eq!(p.name, "c0462d9ce7e44bce97e626c4ae880905");
+        assert_eq!(p.proxy_type, "tcp");
+        // 两段式 localIP/localPort 合并成一段
+        assert_eq!(p.local_addr, "127.0.0.1:25565");
+        assert_eq!(p.remote_port, 38725);
+        // [proxies.transport] bandwidthLimit → 平铺的 bandwidth_limit
+        assert_eq!(p.bandwidth_limit, "25MB");
+        assert_eq!(p.bandwidth_limit_mode, "server");
+        // 代理级 metadatas：这份 Lolia 配置里没有，就该是空的（顶层那份不算）
+        assert!(
+            p.metas.is_empty(),
+            "顶层 [metadatas] 不该跑到代理级 metas 里"
+        );
+    }
+
+    /// 原版 frp 的 `loginFailExit` 也要认，默认值跟随官方取 `true`。
+    ///
+    /// 这一项直接决定"启动器能不能看出隧道没起来"，见 `ClientConfig::login_fail_exit`。
+    #[test]
+    fn login_fail_exit_默认跟随官方取_true() {
+        // 没写 → 默认 true（官方 `util.EmptyOr(..., lo.ToPtr(true))`）
+        assert!(
+            parse_client_toml("server_addr = \"x\"")
+                .unwrap()
+                .login_fail_exit
+        );
+
+        // 原版 frp 写法
+        let off = parse_client_toml("server_addr = \"x\"\nloginFailExit = false").unwrap();
+        assert!(!off.login_fail_exit);
+
+        // NFrp 原生写法，以及"原生优先"规则
+        let native = parse_client_toml("server_addr = \"x\"\nlogin_fail_exit = false").unwrap();
+        assert!(!native.login_fail_exit);
+        let both =
+            parse_client_toml("server_addr = \"x\"\nloginFailExit = true\nlogin_fail_exit = false")
+                .unwrap();
+        assert!(!both.login_fail_exit, "两种写法混用时应以原生字段为准");
+    }
+
+    /// 代理级 `[proxies.metadatas]` 与顶层 `[metadatas]` 是两份互不干扰的数据。
+    #[test]
+    fn 顶层与代理级_metadatas_各归各的() {
+        let text = r#"
+serverAddr = "x"
+user = "alice"
+
+[metadatas]
+token = "login-token"
+
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 1
+remotePort = 2
+
+[proxies.metadatas]
+role = "proxy-role"
+"#;
+        let cfg = parse_client_toml(text).unwrap();
+        assert_eq!(
+            cfg.metas.get("token").map(String::as_str),
+            Some("login-token")
+        );
+        assert_eq!(
+            cfg.proxies[0].metas.get("role").map(String::as_str),
+            Some("proxy-role")
+        );
+        // 不能互相串台
+        assert!(!cfg.proxies[0].metas.contains_key("token"));
+        assert!(!cfg.metas.contains_key("role"));
+    }
+
+    #[test]
+    fn frp_现代写法的_auth_与_transport_子表也要认() {
+        let text = r#"
+serverAddr = "example.com"
+serverPort = 7000
+logLevel = "debug"
+
+[auth]
+token = "s3cret"
+
+[transport]
+poolCount = 4
+tcpMux = false
+protocol = "quic"
+
+[transport.tls]
+enable = true
+serverName = "example.com"
+disableCustomTLSFirstByte = true
+trustedCaFile = "ca.pem"
+certFile = "client.pem"
+keyFile = "client-key.pem"
+
+[[proxies]]
+name = "web"
+type = "http"
+localIP = "10.0.0.5"
+localPort = 8080
+customDomains = ["a.example.com", "b.example.com"]
+httpUser = "u"
+httpPwd = "p"
+hostHeaderRewrite = "backend"
+
+[proxies.loadBalancer]
+group = "g1"
+groupKey = "k1"
+
+[proxies.healthCheck]
+type = "http"
+path = "/healthz"
+timeoutSeconds = 5
+maxFailed = 2
+intervalSeconds = 7
+"#;
+        let cfg = parse_client_toml(text).unwrap();
+
+        assert_eq!(cfg.token, "s3cret");
+        assert_eq!(cfg.log_level, "debug");
+        assert_eq!(cfg.pool_count, 4);
+        assert!(!cfg.tcp_mux);
+        assert_eq!(cfg.transport_protocol, "quic");
+        assert!(cfg.tls_enable);
+        assert_eq!(cfg.tls_server_name, "example.com");
+        assert_eq!(cfg.tls_trusted_ca_file, "ca.pem");
+        assert_eq!(cfg.tls_cert_file, "client.pem");
+        assert_eq!(cfg.tls_key_file, "client-key.pem");
+        // frp 说的是"禁用自定义首字节"，NFrp 说的是"启用" —— 语义相反
+        assert!(!cfg.tls_custom_first_byte);
+
+        let p = &cfg.proxies[0];
+        assert_eq!(p.local_addr, "10.0.0.5:8080");
+        assert_eq!(p.custom_domains, vec!["a.example.com", "b.example.com"]);
+        assert_eq!(p.http_user, "u");
+        assert_eq!(p.http_pwd, "p");
+        assert_eq!(p.host_header_rewrite, "backend");
+        assert_eq!(p.group, "g1");
+        assert_eq!(p.group_key, "k1");
+        assert_eq!(p.health_check_type, "http");
+        assert_eq!(p.health_check_url, "/healthz");
+        assert_eq!(p.health_check_timeout_s, 5);
+        assert_eq!(p.health_check_max_failed, 2);
+        assert_eq!(p.health_check_interval_s, 7);
+    }
+
+    /// ★ v0.6.3 对齐官方：`healthCheck.httpHeaders` 必须被识别。
+    ///
+    /// 官方 `HealthCheckConfig.HTTPHeaders` 用于需要鉴权的健康检查端点。
+    /// 在支持它之前，这类端点一律探测失败 —— 表现为"服务明明活着，
+    /// 客户端却判定它不健康、把流量摘掉"。
+    #[test]
+    fn 官方的_healthcheck_httpheaders_能被解析() {
+        let text = r#"
+serverAddr = "127.0.0.1"
+serverPort = 17000
+
+[[proxies]]
+name = "api"
+type = "tcp"
+localIP = "10.0.0.5"
+localPort = 8080
+
+[proxies.healthCheck]
+type = "http"
+path = "/healthz"
+intervalSeconds = 5
+
+[[proxies.healthCheck.httpHeaders]]
+name = "Authorization"
+value = "Bearer secret-token"
+
+[[proxies.healthCheck.httpHeaders]]
+name = "X-Health-Source"
+value = "nfrp"
+"#;
+        let cfg = parse_client_toml(text).expect("官方写法应当能解析");
+        let p = &cfg.proxies[0];
+
+        assert_eq!(p.health_check_type, "http");
+        assert_eq!(p.health_check_url, "/healthz");
+        assert_eq!(
+            p.health_check_http_headers.len(),
+            2,
+            "两个 httpHeaders 都该被搬过来，实际：{:?}",
+            p.health_check_http_headers
+        );
+        assert_eq!(p.health_check_http_headers[0].name, "Authorization");
+        assert_eq!(p.health_check_http_headers[0].value, "Bearer secret-token");
+        assert_eq!(p.health_check_http_headers[1].name, "X-Health-Source");
+        assert_eq!(p.health_check_http_headers[1].value, "nfrp");
+    }
+
+    /// 不配 `httpHeaders` 时应当是空表，而不是报错。
+    #[test]
+    fn 没配_httpheaders_时是空表() {
+        let text = r#"
+serverAddr = "127.0.0.1"
+serverPort = 17000
+
+[[proxies]]
+name = "api"
+type = "tcp"
+localIP = "10.0.0.5"
+localPort = 8080
+
+[proxies.healthCheck]
+type = "http"
+path = "/healthz"
+"#;
+        let cfg = parse_client_toml(text).expect("应当能解析");
+        assert!(
+            cfg.proxies[0].health_check_http_headers.is_empty(),
+            "没配 httpHeaders 时必须是空表"
+        );
+    }
+
+    #[test]
+    fn nfrp_原生写法完全不受影响() {
+        let text = r#"
+server_addr = "127.0.0.1"
+server_port = 17000
+token = "t"
+
+[[proxies]]
+name = "ssh"
+type = "tcp"
+local_addr = "127.0.0.1:22"
+remote_port = 6000
+"#;
+        let cfg = parse_client_toml(text).unwrap();
+        assert_eq!(cfg.server_addr, "127.0.0.1");
+        assert_eq!(cfg.proxies[0].local_addr, "127.0.0.1:22");
+    }
+
+    #[test]
+    fn 两种写法混用时以_nfrp_原生字段为准() {
+        let text = r#"
+serverAddr = "frp.example.com"
+server_addr = "native.example.com"
+serverPort = 7000
+
+[[proxies]]
+name = "mix"
+type = "tcp"
+local_addr = "1.1.1.1:11"
+localIP = "2.2.2.2"
+localPort = 22
+"#;
+        let cfg = parse_client_toml(text).unwrap();
+        // `server_addr` 已存在 → 保留原生值，丢弃 serverAddr
+        assert_eq!(cfg.server_addr, "native.example.com");
+        // `local_addr` 已存在 → 保留原生值，忽略 localIP/localPort
+        assert_eq!(cfg.proxies[0].local_addr, "1.1.1.1:11");
+    }
+
+    #[test]
+    fn ipv6_地址合并要加方括号() {
+        let text = r#"
+server_addr = "x"
+[[proxies]]
+name = "v6"
+type = "tcp"
+localIP = "::1"
+localPort = 22
+remote_port = 1
+"#;
+        let cfg = parse_client_toml(text).unwrap();
+        assert_eq!(cfg.proxies[0].local_addr, "[::1]:22");
+    }
+
+    #[test]
+    fn visitors_里的_frp_键名也能认() {
+        let text = r#"
+server_addr = "x"
+[[visitors]]
+name = "v"
+type = "xtcp"
+serverName = "p2p-echo"
+serverUser = "alice"
+secretKey = "sk"
+bindAddr = "127.0.0.1"
+bindPort = 9001
+"#;
+        let cfg = parse_client_toml(text).unwrap();
+        let v = &cfg.visitors[0];
+        assert_eq!(v.server_name, "p2p-echo");
+        assert_eq!(v.server_user, "alice");
+        assert_eq!(v.secret_key, "sk");
+        assert_eq!(v.bind_addr, "127.0.0.1");
+        assert_eq!(v.bind_port, 9001);
+    }
+
+    /// ★ 回归：官方 `frpc_full_example.toml` 的 `vnet-visitor` 写的是 `bindPort = -1`，
+    /// 官方语义为"不监听本地端口"。这里用 `u16` 会让**整份官方配置解析失败**。
+    #[test]
+    fn visitor_的_bind_port_接受官方的负数写法() {
+        let text = r#"
+server_addr = "x"
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+secretKey = "your-secret-key"
+bindPort = -1
+"#;
+        let cfg = parse_client_toml(text).expect("官方的 bindPort = -1 必须能解析");
+        assert_eq!(cfg.visitors[0].bind_port, -1);
+        assert!(cfg.visitors[0].bind_port <= 0, "负数表示不监听");
+    }
+
+    /// 官方整份 `frpc_full_example.toml` 里 visitor 之外还有 `bindPort = -1` 之外的坑，
+    /// 这里只锁"解析阶段不被 u16 拦住"这一条 —— 用官方原文里的那一段做逐字回归。
+    #[test]
+    fn 官方示例里的_visitors_段能整体解析() {
+        let text = r#"
+serverAddr = "x"
+serverPort = 7000
+
+[[visitors]]
+name = "secret_tcp_visitor"
+type = "stcp"
+serverName = "secret_tcp"
+secretKey = "abcdefg"
+bindAddr = "127.0.0.1"
+bindPort = 9000
+
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+secretKey = "your-secret-key"
+bindPort = -1
+"#;
+        let cfg = parse_client_toml(text).expect("官方 visitors 段必须能整体解析");
+        assert_eq!(cfg.visitors.len(), 2);
+        let ports: Vec<i32> = cfg.visitors.iter().map(|v| v.bind_port).collect();
+        assert_eq!(ports, vec![9000, -1]);
+    }
+
+    #[test]
+    fn 插件代理省略本机地址时按_frp_默认值补齐() {
+        let text = r#"
+server_addr = "x"
+[[proxies]]
+name = "socks"
+type = "tcp"
+remote_port = 1080
+[proxies.plugin]
+type = "socks5"
+"#;
+        let cfg = parse_client_toml(text).unwrap();
+        assert_eq!(cfg.proxies[0].plugin, "socks5");
+        assert_eq!(cfg.proxies[0].local_addr, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn 原版_frps_配置的默认写法也要能解析() {
+        let text = r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+logLevel = "info"
+vhostHTTPPort = 8080
+subdomainHost = "example.com"
+
+[auth]
+token = "st"
+
+[transport.tls]
+force = true
+certFile = "server.pem"
+keyFile = "server-key.pem"
+trustedCaFile = "ca.pem"
+
+[webServer]
+port = 7500
+user = "admin"
+password = "pw"
+"#;
+        let cfg = parse_server_toml(text).unwrap();
+        assert_eq!(cfg.bind_addr, "0.0.0.0");
+        // frp 的 bindPort 是"控制+工作同端口"，对应 NFrp 的 bind_port
+        assert_eq!(cfg.bind_port, Some(7000));
+        assert_eq!(cfg.token, "st");
+        assert_eq!(cfg.vhost_http_port, Some(8080));
+        assert_eq!(cfg.subdomain_host, "example.com");
+        assert!(cfg.tls_force);
+        assert_eq!(cfg.tls_cert_file, "server.pem");
+        assert_eq!(cfg.tls_key_file, "server-key.pem");
+        assert_eq!(cfg.tls_trusted_ca_file, "ca.pem");
+        assert_eq!(cfg.dashboard_port, Some(7500));
+        assert_eq!(cfg.dashboard_user, "admin");
+        assert_eq!(cfg.dashboard_pwd, "pw");
+    }
+
+    /// ★ 官方文档与 `frps_full_example.toml` 里写的是 `subDomainHost`（大写 D）。
+    ///
+    /// 官方 frp 读配置是 `toml → json → json.Unmarshal`，Go 的 `encoding/json`
+    /// 匹配字段名走 `strings.EqualFold`（**大小写不敏感**），所以这几种写法官方都认。
+    /// NFrp 早期只做精确匹配 → 官方写法被当成未知键静默丢掉，真机对拍表现为客户端报
+    /// 「代理注册失败：客户端用了 subdomain，但服务端未配置 subdomain_host」
+    /// （复现脚本：`tmp/interop_subdomain.py`）。
+    #[test]
+    fn 官方文档里的_subdomain_host_大小写变体都要认() {
+        for key in [
+            "subDomainHost",
+            "subdomainHost",
+            "SubDomainHost",
+            "SUBDOMAINHOST",
+        ] {
+            let text = format!("bindPort = 7000\n{} = \"example.com\"\n", key);
+            let cfg = parse_server_toml(&text).unwrap();
+            assert_eq!(cfg.subdomain_host, "example.com", "服务端键 {key} 未被识别");
+            assert!(
+                cfg.unsupported_fields.is_empty(),
+                "服务端键 {key} 不该被当成未实现字段"
+            );
+        }
+    }
+
+    /// 两套写法同时出现时，**NFrp 原生键优先**（只补不覆盖），
+    /// 且不能撞出 serde 的 "duplicate field"。
+    #[test]
+    fn 原生键优先于_frp_键的大小写变体() {
+        let text = "bindPort = 7000\nsubdomain_host = \"native.com\"\n\
+                    subDomainHost = \"frp.com\"\n";
+        let cfg = parse_server_toml(text).unwrap();
+        assert_eq!(cfg.subdomain_host, "native.com");
+    }
+
+    /// 客户端侧的分子表路径（`[transport.tls]`）同样要折叠大小写。
+    #[test]
+    fn 客户端分子表路径的键名也折叠大小写() {
+        let text = r#"
+serverAddr = "x"
+serverPort = 7000
+[Transport]
+protocol = "kcp"
+[Transport.TLS]
+enable = true
+"#;
+        let cfg = parse_client_toml(text).unwrap();
+        assert_eq!(cfg.transport_protocol, "kcp");
+        assert!(cfg.tls_enable);
+    }
+
+    /// 已实现字段必须能读进来，且**不能**再被误报成“未实现”。
+    ///
+    /// `PprofEnable` 是官方 `webServer.pprofEnable` 的顶层写法（老版本
+    /// frps 也认）；这里同时验证大小写不敏感。历史上 `AllowPorts` /
+    /// `ProxyBindAddr` / `QuicBindPort` 也当过这个测试的主角，实现后都应
+    /// 从“未实现”清单里删掉 —— 否则会出现反向的假警报。
+    #[test]
+    fn 已实现字段不再误报未实现且折叠大小写() {
+        let text = "bindPort = 7000\nPprofEnable = true\n";
+        let cfg = parse_server_toml(text).unwrap();
+        assert!(cfg.pprof_enable);
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "PprofEnable 已实现，不应再报告未实现：{:?}",
+            cfg.unsupported_fields
+        );
+    }
+
+    /// ★ v0.6.5：`quicBindPort` 已实现 —— 必须能真正读进来，
+    /// 且**不再**出现在"未实现"清单里。
+    ///
+    /// 官方语义：配了就开一个**独立** UDP 端口，与 `bindPort` 无关。
+    #[test]
+    fn quicbindport_已实现且能读进来() {
+        // 官方 camelCase 写法
+        let cfg = parse_server_toml("bindPort = 7000\nquicBindPort = 7101\n").unwrap();
+        assert_eq!(
+            cfg.quic_bind_port,
+            Some(7101),
+            "quicBindPort 必须读进 quic_bind_port"
+        );
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "实现了就不能再报未实现，实际：{:?}",
+            cfg.unsupported_fields
+        );
+
+        // NFrp 的 snake_case 写法也要认
+        let cfg2 = parse_server_toml("bind_port = 7000\nquic_bind_port = 7102\n").unwrap();
+        assert_eq!(cfg2.quic_bind_port, Some(7102));
+
+        // 不配就是 None（旧行为：`transport_protocol = quic` 时才用 bindPort）
+        let cfg3 = parse_server_toml("bind_port = 7000\n").unwrap();
+        assert_eq!(cfg3.quic_bind_port, None);
+    }
+
+    /// 限制①批次1：这批客户端字段已实现 —— 既不能再被报"未实现"，
+    /// 值也要真的落到配置里（含官方 camelCase 写法）。
+    #[test]
+    fn 批次1客户端字段读到值且不再报未实现() {
+        let raw = r#"
+serverAddr = "example.com"
+serverPort = 7000
+
+[transport]
+dialServerTimeout = 7
+connectServerLocalIP = "192.168.1.5"
+
+[log]
+disablePrintColor = true
+
+[[proxies]]
+name = "p-off"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+enabled = false
+
+[[proxies]]
+name = "p-on"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 23
+remotePort = 6001
+annotations = { "example.com/team" = "infra" }
+
+[[visitors]]
+name = "v-off"
+type = "stcp"
+serverName = "target"
+secretKey = "k"
+enabled = false
+"#;
+        let cfg = crate::config::parse_client(raw).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.dial_server_timeout, 7);
+        assert_eq!(cfg.connect_server_local_ip, "192.168.1.5");
+        assert!(cfg.disable_print_color);
+        // enabled = false 的代理 / 访客在解析期被摘掉（官方 FilterClientConfigurers）
+        assert_eq!(cfg.proxies.len(), 1, "禁用的代理不该留下");
+        assert_eq!(cfg.proxies[0].name, "p-on");
+        assert_eq!(
+            cfg.proxies[0]
+                .annotations
+                .get("example.com/team")
+                .map(String::as_str),
+            Some("infra")
+        );
+        assert!(cfg.visitors.is_empty(), "禁用的访客不该留下");
+    }
+
+    /// 限制①批次1：服务端四个字段（proxyBindAddr / userConnTimeout /
+    /// maxPoolCount / disablePrintColor）同样要读进来且不报未实现。
+    #[test]
+    fn 批次1服务端字段读到值且不再报未实现() {
+        let raw = r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+proxyBindAddr = "192.168.1.5"
+userConnTimeout = 3
+
+[transport]
+maxPoolCount = 4
+
+[log]
+disablePrintColor = true
+"#;
+        let cfg = parse_server_toml(raw).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.proxy_bind_addr, "192.168.1.5");
+        assert_eq!(cfg.effective_proxy_bind_addr(), "192.168.1.5");
+        assert_eq!(cfg.user_conn_timeout(), std::time::Duration::from_secs(3));
+        assert_eq!(cfg.max_pool_count, 4);
+        assert!(cfg.disable_print_color);
+    }
+
+    /// 限制①批次2：keepalive 组四个字段（客户端 `dialServerKeepalive` /
+    /// `tcpMuxKeepaliveInterval`，服务端 `tcpMuxKeepaliveInterval` /
+    /// `tcpKeepalive`）既能读官方 camelCase 写法，也不再被报"未实现"。
+    #[test]
+    fn 批次2keepalive字段读到值且不再报未实现() {
+        let c = r#"
+serverAddr = "example.com"
+serverPort = 7000
+
+[transport]
+dialServerKeepalive = 111
+tcpMuxKeepaliveInterval = 22
+"#;
+        let cfg = crate::config::parse_client(c).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.dial_server_keepalive, 111);
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 22);
+
+        let s = r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+[transport]
+tcpMuxKeepaliveInterval = 33
+tcpKeepalive = 444
+"#;
+        let cfg = parse_server_toml(s).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 33);
+        assert_eq!(cfg.tcp_keepalive, 444);
+    }
+
+    /// 限制①批次2：默认值取官方（7200 / 30 / 30 / 7200），不写就是这四档；
+    /// 显式写 `0` 保持"关闭"的原意，不被折算成官方默认。
+    #[test]
+    fn 批次2keepalive默认值与零语义() {
+        let cfg = crate::config::parse_client("serverAddr = \"x\"\n").unwrap();
+        assert_eq!(cfg.dial_server_keepalive, 7200);
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 30);
+
+        let cfg = parse_server_toml("bindPort = 7000\n").unwrap();
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 30);
+        assert_eq!(cfg.tcp_keepalive, 7200);
+
+        // 0 = 关闭（不复刻官方 EmptyOr 的 0→默认 折算）
+        let cfg = crate::config::parse_client(
+            "serverAddr = \"x\"\n[transport]\ndialServerKeepalive = 0\ntcpMuxKeepaliveInterval = 0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.dial_server_keepalive, 0);
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 0);
+        let cfg = parse_server_toml(
+            "bindPort = 7000\n[transport]\ntcpMuxKeepaliveInterval = 0\ntcpKeepalive = 0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.tcp_mux_keepalive_interval, 0);
+        assert_eq!(cfg.tcp_keepalive, 0);
+    }
+
+    /// 官方 0.71 新增的四个服务端字段：`pprofEnable`、
+    /// `natholeAnalysisDataReserveHours`、`[[httpPlugins]]`、
+    /// `[sshTunnelGateway]`。它们不只是“能解析”，还必须真的落到运行时字段。
+    #[test]
+    fn 官方071新增服务端字段全部读入() {
+        let raw = r#"
+bindAddr = "127.0.0.1"
+bindPort = 7000
+pprofEnable = true
+natholeAnalysisDataReserveHours = 12
+
+[[httpPlugins]]
+name = "auth"
+addr = "127.0.0.1:9000"
+path = "/handler"
+ops = ["Login", "NewProxy"]
+tlsVerify = true
+
+[sshTunnelGateway]
+bindPort = 2200
+privateKeyFile = "/tmp/host_key"
+autoGenPrivateKeyPath = "/tmp/autogen"
+authorizedKeysFile = "/tmp/authorized_keys"
+"#;
+        let cfg = parse_server_toml(raw).unwrap();
+        assert!(cfg.pprof_enable);
+        assert_eq!(cfg.nathole_analysis_data_reserve_hours, 12);
+        assert_eq!(cfg.http_plugins.len(), 1);
+        assert_eq!(cfg.http_plugins[0].name, "auth");
+        assert_eq!(cfg.http_plugins[0].ops, vec!["Login", "NewProxy"]);
+        assert!(cfg.http_plugins[0].tls_verify);
+        assert_eq!(cfg.ssh_tunnel_gateway.bind_port, 2200);
+        assert_eq!(
+            cfg.ssh_tunnel_gateway.authorized_keys_file,
+            "/tmp/authorized_keys"
+        );
+        assert!(cfg.unsupported_fields.is_empty());
+    }
+
+    /// `webServer.pprofEnable` 的旧写法（官方文档把它列在 `[webServer]` 下）
+    /// 也要 hoist 到顶层，且大小写不敏感。
+    #[test]
+    fn web_server_pprof_enable也能读() {
+        let cfg = parse_server_toml(
+            "bindPort = 7000\n[webServer]\nPprofEnable = true\nassetsDir = \"/srv/www\"\n",
+        )
+        .unwrap();
+        assert!(cfg.pprof_enable);
+        assert_eq!(cfg.assets_dir, "/srv/www");
+        assert!(cfg.unsupported_fields.is_empty());
+    }
+
+    /// `proxyBindAddr` 留空时跟随 `bind_addr`（官方 `Complete()` 语义），
+    /// 保证默认配置下行为与老版本完全一致。
+    #[test]
+    fn 代理绑定地址留空跟随_bind_addr() {
+        let cfg = parse_server_toml("bindAddr = \"10.0.0.1\"\nbindPort = 7000\n").unwrap();
+        assert_eq!(cfg.proxy_bind_addr, "");
+        assert_eq!(cfg.effective_proxy_bind_addr(), "10.0.0.1");
+    }
+
+    /// `userConnTimeout = 0` 按官方 `EmptyOr` 口径折算为默认 10 秒（不是"不限"）。
+    #[test]
+    fn user_conn_timeout_零折算为官方默认() {
+        let cfg = parse_server_toml("bindPort = 7000\n").unwrap();
+        assert_eq!(cfg.user_conn_timeout(), std::time::Duration::from_secs(10));
+        let cfg = parse_server_toml("bindPort = 7000\nuserConnTimeout = 0\n").unwrap();
+        assert_eq!(cfg.user_conn_timeout(), std::time::Duration::from_secs(10));
+    }
+
+    /// 注解键按官方 `ValidateAnnotations` 口径校验：合法键放行（大写折叠、
+    /// 前缀 `x/y` 都算合法），非法键与超限总大小报错。
+    #[test]
+    fn 注解键按官方口径校验() {
+        let ok = r#"
+serverAddr = "example.com"
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+annotations = { "example.com/Team_Name" = "a", "Key" = "b" }
+"#;
+        let cfg = crate::config::parse_client(ok).unwrap();
+        assert_eq!(cfg.proxies.len(), 1);
+
+        let bad = r#"
+serverAddr = "example.com"
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+annotations = { "has space" = "x" }
+"#;
+        let err = crate::config::parse_client(bad).unwrap_err().to_string();
+        assert!(err.contains("注解"), "报错应点名注解键：{err}");
+
+        let too_big = format!(
+            r#"
+serverAddr = "example.com"
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6000
+annotations = {{ "k" = "{}" }}
+"#,
+            "a".repeat(256 * 1024)
+        );
+        let err = crate::config::parse_client(&too_big)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("256"), "超限报错要给出上限：{err}");
+    }
+
+    /// 禁用条目的校验时机与官方一致：**解码类**错误（未知类型）照旧报
+    /// （官方在解码阶段就拦），**结构化**校验（tcpmux / 注解）跳过
+    /// （官方校验发生在 enabled 过滤之后）。
+    #[test]
+    fn 禁用条目的校验时机与官方一致() {
+        // ① 禁用 + 未知代理类型 ⇒ 依然报错
+        let raw = r#"
+serverAddr = "example.com"
+[[proxies]]
+name = "p"
+type = "tunnel"
+localIP = "127.0.0.1"
+localPort = 22
+enabled = false
+"#;
+        assert!(
+            crate::config::parse_client(raw).is_err(),
+            "未知类型在官方解码阶段就报错，enabled = false 不能让它合法"
+        );
+
+        // ② 禁用 + tcpmux 缺约束 ⇒ 放行（过滤后才校验）
+        let raw = r#"
+serverAddr = "example.com"
+[[proxies]]
+name = "p"
+type = "tcpmux"
+localIP = "127.0.0.1"
+localPort = 22
+enabled = false
+"#;
+        let cfg = crate::config::parse_client(raw).unwrap();
+        assert!(cfg.proxies.is_empty(), "禁用条目应被摘掉而不是报错");
+    }
+
+    /// 已实现的字段即使写成**别的大小写**也不能再被误报。
+    #[test]
+    fn 已实现的字段换个大小写也不报未实现() {
+        let text = "bindPort = 7000\nAllowPorts = [{ single = 8443 }]\nMaxPortsPerClient = 3\n";
+        let cfg = parse_server_toml(text).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "实际：{:?}",
+            cfg.unsupported_fields
+        );
+        assert!(cfg.port_allowed(8443));
+        assert_eq!(cfg.max_ports_per_client, 3);
+    }
+
+    /// `transport.tls.certFile` 已实现，但 `webServer.tls.certFile` 没有；
+    /// 两者同名，必须按路径区分，不能因为前者实现就把后者一起“洗白”。
+    #[test]
+    fn 面板_tls_字段已经实现所以不再报未实现() {
+        // ★ v0.6.6：`webServer.tls.certFile` / `keyFile` 已经真正实现了
+        // （面板 HTTPS：rustls 包装 dashboard / client web 的监听器，
+        //   并在 HTTPS 响应上带 HSTS）。
+        //
+        // 这条测试原来断言"仍要报未实现" —— 实现之后必须反过来，
+        // 否则会出现"功能可用却告警说没实现"的反向假警报。
+        let cfg = parse_server_toml(
+            "[webServer.tls]\ncertFile = \"server.crt\"\nkeyFile = \"server.key\"\n",
+        )
+        .unwrap();
+
+        assert!(
+            !cfg.unsupported_fields
+                .iter()
+                .any(|f| f.starts_with("webServer.tls.")),
+            "实现之后不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+
+        // 而且值要真的落到配置里（不是"不报错但也没读进去"）
+        let (cert, key) = cfg
+            .web_tls()
+            .files()
+            .expect("cert/key 成对，不该报错")
+            .expect("两个都配了，应当有值");
+        assert_eq!(cert, "server.crt");
+        assert_eq!(key, "server.key");
+    }
+
+    /// Stage 5 降级（Phaedra 不可得）：定向变异，只要求**不 panic**。
+    ///
+    /// 这不是覆盖率 fuzz，也不声称发现了多少问题；它只把"解析器遇到
+    /// 任意截断/拼接/乱码 TOML 时会不会把进程带崩"变成可重复的门。
+    /// 断言故意很弱：`Ok` / `Err` 都接受，panic 就失败。
+    #[test]
+    fn 定向变异配置不应_panic() {
+        let seeds = [
+            r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+token = "t"
+[transport.tls]
+enable = true
+serverName = "x"
+[[proxies]]
+name = "web"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8080
+remotePort = 18080
+"#,
+            r#"
+bindAddr = "0.0.0.0"
+bindPort = 7000
+vhostHTTPPort = 8080
+[auth]
+method = "token"
+token = "t"
+[transport.tls]
+force = true
+"#,
+            r#"
+serverAddr = "x"
+[[visitors]]
+name = "v"
+type = "stcp"
+serverName = "s"
+secretKey = "k"
+bindAddr = "127.0.0.1"
+bindPort = 9000
+"#,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for seed in seeds {
+            for _ in 0..400 {
+                let mut bytes = seed.as_bytes().to_vec();
+                match next() % 3 {
+                    0 if !bytes.is_empty() => {
+                        let i = (next() as usize) % bytes.len();
+                        bytes[i] = (next() % 0x7f) as u8;
+                    }
+                    1 if !bytes.is_empty() => {
+                        let i = (next() as usize) % bytes.len();
+                        bytes.remove(i);
+                    }
+                    _ => {
+                        let i = (next() as usize) % (bytes.len() + 1);
+                        bytes.insert(i, (next() % 0x7f) as u8);
+                    }
+                }
+                // 只喂合法 UTF-8；非法字节序列由 TOML 解析器直接拒绝，
+                // 不在本测试的断言范围内（那属于字节层 fuzz）。
+                let text = String::from_utf8_lossy(&bytes);
+                let _ = parse_client_toml(&text);
+                let _ = parse_server_toml(&text);
+            }
+        }
+    }
+}

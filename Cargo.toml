@@ -1,0 +1,177 @@
+[workspace]
+resolver = "2"
+members = ["common", "server", "client"]
+
+[workspace.package]
+# 本项目是「Rust-Frp 协议基座 + WSS 直连 + IP4P」的整合发行版。
+# 版本独立于上游；线协议兼容标记（frpc -v 输出）仍固定为 0.71.0，不要改。
+version = "0.8.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["wengjing086", "nfrp contributors"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/wengjing086/rust-frp-wss-ip4p"
+homepage = "https://github.com/wengjing086/rust-frp-wss-ip4p"
+
+
+
+
+[workspace.dependencies]
+# 内部 crate
+nfrp-common = { path = "common", version = "0.8.0" }
+
+# 外部依赖（统一在此处锁定版本，保证各 crate 一致）
+# frp v2 控制通道加密，对应官方 go 实现的 HKDF-SHA256 + AES-256-GCM
+aes-gcm = "0.10"
+# frp v1 控制通道加密：AES-128-CFB 流密码（golib/crypto 用的是 aes.BlockSize 密钥）
+aes = "0.8"
+# frp v1 密钥派生：PBKDF2-HMAC-SHA1(token, "crypto", 64, 16)
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+hkdf = "0.12"
+md-5 = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+
+# xtcp 真 P2P：QUIC 直连（打洞成功后用它承载业务数据）
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+] }
+
+# 传输层增强：yamux 多路复用（frp transport.tcpMux）+ TLS（frp transport.tls）
+yamux = "0.13"
+# 注：0.23.44 起 dangerous API（跳过证书校验）不再需要 feature gate。
+# frp 客户端默认 InsecureSkipVerify=true，所以这里必须能用到它。
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+rcgen = { version = "0.13", default-features = false, features = [
+    "ring",
+    "pem",
+] }
+
+# OIDC：验证 IdP 签发的 RS256 JWT（ring 已经由 rustls 间接引入，这里显式依赖）
+ring = "0.17"
+# SSH 隧道网关（官方 [sshTunnelGateway]）。默认的 aws-lc-rs 太重，复用 ring 后端。
+# ★ 0.60.3 是修复 RUSTSEC-2026-0154 / -0153（无界 32 位分配）的最低版本。
+# 不开 rsa feature：rsa crate 带着 RUSTSEC-2023-0071（Marvin Attack，
+# 官方声明无修复版本）与 RUSTSEC-2026-0387（crypto-bigint 常量时间问题）。
+# 关掉它只影响 "RSA 客户端证书认证"，ed25519 / ECDSA 照常可用。
+russh = { version = "0.65", default-features = false, features = ["ring"] }
+# OIDC / JWKS 走 HTTPS 需要一份内置根证书；系统根证书在部分 Linux 上要去读
+# /etc/ssl/certs 且路径因发行版而异，内置一份最省事（纯数据 crate，无 C 依赖）
+webpki-roots = "0.26"
+
+# VirtualNet 的 TUN 设备需要 ioctl / fcntl / open
+libc = "0.2"
+
+# TCP keepalive 调优（限制①批次2：dialServerKeepalive / tcpKeepalive）：
+# `set_tcp_keepalive` / `TcpKeepalive` 无门控；读回 getter（测试用）在 Unix 上
+# 需要 "all"。socket2 本来就在依赖树里（tokio 间接引入），转为直接依赖，
+# 不新增任何 crate。
+socket2 = { version = "0.6", features = ["all"] }
+
+anyhow = "1.0"
+bytes = "1"
+# snappy 压缩（官方 frp 的 useCompression 用的就是 Snappy framed 格式）
+snap = "1.1"
+# CPU profiling（官方 frps/frpc 的 pprofEnable；输出 Go pprof 兼容格式）
+pprof = { version = "0.15", default-features = false, features = ["prost-codec", "frame-pointer"] }
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+# 只启用实际用到的特性（相比 "full" 显著减小体积与编译时间）：
+# macros(select!/main) rt-multi-thread net io-util(copy_bidirectional) time signal(Ctrl+C)
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "signal",
+] }
+# compat：yamux 用 futures 的 IO trait，需要它来和 tokio 的流互相转换
+tokio-util = { version = "0.7", features = ["codec", "io", "compat"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi", "registry", "std"] }
+
+# release 优化：体积优先（opt-level="z"）+ 全量 LTO，降低二进制体积与常驻内存
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+#
+# ★★ v0.5.8：`opt-level` 由 `"s"` 改为 `"z"`（第七轮，**纯体积优化**）
+#
+# 用户的要求是"别动功能和安全，纯粹缩小"。所以这里**只改编译参数**，
+# 一行代码、一个依赖 feature、一处 panic 策略都没动。
+#
+# ## 实测（`tmp/audit7/size_lab7.py`，同一台机器、同一次会话，逐个 target 量）
+#
+# | 配置 | nfrp-server | 变化 | nfrp-client | 变化 |
+# |---|---|---|---|---|
+# | 原 `opt-level="s"`（基线） | 3,785,728 B | — | 3,846,144 B | — |
+# | **`opt-level="z"`（本版采用）** | **3,417,600 B** | **−9.72%** | **3,488,768 B** | **−9.29%** |
+# | `opt-level="z"` + `lto="thin"`（对照） | 3,738,112 B | −1.26% | 3,774,464 B | −1.86% |
+#
+# ⇒ `"z"` 比 `"s"` 再小约 **9.5%**（两个二进制都一致），而 `lto="thin"` 明显更差
+#   （对照确认 `lto=true`（fat）是必要的，不能为编译速度换掉）。
+#
+# ## 也试过但**无效**的（如实记录，免得后人再试一遍）
+#
+# | 手段 | 实测效果 | 原因 |
+# |---|---|---|
+# | `/OPT:REF`（link-arg） | **0.00%** | MSVC release 下**已默认开启** |
+# | `/OPT:ICF`（link-arg） | **0.00%** | Rust 生成的 COMDAT 里没有逐字节相同的函数体可供折叠 |
+#
+# 脚本：`tmp/audit7/size_lab7_links.py`。两次实验后 `Cargo.toml` 均按 sha256 逐字节还原。
+#
+# ## 为什么 `"z"` 是行为中性的
+#
+# `opt-level` 只影响**代码生成的优化力度**，不改变：
+#   * 程序语义（Rust 保证任何 opt-level 下行为一致）；
+#   * panic 策略（仍由下面那行 `panic = "abort"` 决定，未动）；
+#   * CLI 输出、日志格式、协议行为（均无变化）。
+# ⇒ 满足"别动功能和安全"的前提。
+#
+# 验证：改完后 `cargo test --workspace` 全绿；端到端冒烟与官方 frpc 互通另行复测。
+#
+# ★★ 关于 `panic = "abort"`（审计总报告 L17，低危）——**评估后有意保留**
+#
+# 这个设置意味着：**任何一个连接任务 panic 都会终止整个服务端进程**
+# （而 `unwind` 下 tokio 只让那一个任务死掉，其余连接不受影响）。
+#
+# 我按报告的建议实测评估过，两边的代价都量了出来：
+#
+# | 策略 | nfrp-server | nfrp-client | 单个任务 panic 时 |
+# |---|---|---|---|
+# | `abort`（本版采用） | 3,780,096 B | 3,845,632 B | **整个进程终止** |
+# | `unwind`（默认） | 5,637,632 B | 5,792,256 B | 只有那条连接死 |
+#
+# ⇒ 换用 `unwind` 的代价是 **+49.1% / +50.6% 体积**。
+#
+# 为什么最终**保留 abort**：
+#   * **收益无可证实的触发点** —— 审计报告自己写的是"未发现可远程触发的
+#     panic 点，防御性建议"；本项目 66 万条随机输入的 fuzz 同样**零 panic**；
+#   * 项目把这个 profile 的注释写成"**体积优先**"，这是**有意的产品目标** ——
+#     本工具分发到 Android / 云手机，体积对用户是实打实的成本；
+#   * 代码里没有裸 `unwrap()` 的输入路径（互斥锁一律
+#     `unwrap_or_else(|e| e.into_inner())`，锁中毒不会 panic）。
+#
+# ★ 怎么翻转这个决定：删掉上面那行 `panic = "abort"` 即可（默认就是 unwind）。
+#   如果你**能**找到一条可远程触发的 panic 路径，请立刻删掉它，
+#   并把那条路径补成回归测试 —— 那时 50% 体积换"不全服宕机"是划算的。

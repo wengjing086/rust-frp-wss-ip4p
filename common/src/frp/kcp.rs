@@ -1,0 +1,1829 @@
+//! KCP：跑在 UDP 上的可靠有序传输，作为 xtcp 在弱网下的**备选**数据通道。
+//!
+//! ## 为什么还要一个 KCP
+//!
+//! QUIC 很完善，但它的重传策略是为"公网 + 中等丢包"设计的：丢一个包要等
+//! RTO（至少 200ms 量级）才重传，而且按**包号**判定丢包。移动网络 / 跨国链路
+//! 上丢包率能到 5%~20%，这时 QUIC 的吞吐会被重传等待拖垮。
+//!
+//! KCP 换了个思路，牺牲带宽换延迟：
+//!
+//! * **选择性重传**：收到 `sn=3` 而 `sn=1` 没到，立刻给 `sn=1` 记一次
+//!   `fastack`；攒够 [`IKCP_FASTACK_LIMIT`] 次就**不等 RTO**直接重传；
+//! * **更密的 `update`**：默认 10ms 一跳，丢包能被更早发现；
+//! * **可关拥塞控制**：`nodelay` 打开后窗口不再因丢包腰斩。
+//!
+//! 代价是 KCP 不加密。P2P 场景里这一点可以接受 —— 通道建立后还有一层
+//! 应用口令鉴权（与 QUIC 侧完全一致），口令不对的连接会被立刻关掉。
+//!
+//! ## 实现范围
+//!
+//! 这是 `ikcp` / `kcp-go` 的精简移植，**只做 Rust 侧两端都用得到的部分**：
+//! 分片与重组、UNA + ACK、快速重传、RTO 计算、窗口探测。
+//! 没做 FEC（kcp-go 里也是可选）和流控的 `nocwnd` 之外的调优开关。
+//! 两端都是 nfrp，所以不需要与 kcp-go 的字节流严格对齐。
+
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
+
+use bytes::Bytes;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::UdpSocket,
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    time::interval,
+};
+
+use crate::util::RateLimited;
+
+// ---------------------------------------------------------------------------
+// 常量（ikcp.go）
+// ---------------------------------------------------------------------------
+
+const IKCP_RTO_NDL: u32 = 30; // no delay min rto
+const IKCP_RTO_MIN: u32 = 100; // normal min rto
+const IKCP_RTO_DEF: u32 = 200;
+const IKCP_RTO_MAX: u32 = 60_000;
+
+const IKCP_CMD_PUSH: u8 = 81; // cmd: push data
+const IKCP_CMD_ACK: u8 = 82; // cmd: ack
+const IKCP_CMD_WASK: u8 = 83; // cmd: window probe (ask)
+const IKCP_CMD_WINS: u8 = 84; // cmd: window size (tell)
+const IKCP_ASK_SEND: u32 = 1; // need to send IKCP_CMD_WASK
+const IKCP_ASK_TELL: u32 = 2; // need to send IKCP_CMD_WINS
+
+const IKCP_WND_SND: u32 = 32;
+const IKCP_WND_RCV: u32 = 128;
+const IKCP_MTU_DEF: usize = 1400;
+const IKCP_INTERVAL: u32 = 10;
+const IKCP_OVERHEAD: usize = 24;
+const IKCP_FASTACK_LIMIT: u32 = 5;
+const IKCP_THRESH_INIT: u32 = 2;
+const IKCP_THRESH_MIN: u32 = 2;
+const IKCP_PROBE_INIT: u32 = 7000;
+const IKCP_PROBE_LIMIT: u32 = 120_000;
+
+/// KCP **接收侧**单条消息的大小上限（v0.5.6 修审计总报告 M10）。
+///
+/// 发送侧本来就有上限（`encode_segs` 的 `count > 255` 拒绝），接收侧原先
+/// **没有** —— 于是单会话在途内存可达 `IKCP_WND_RCV(128) × 65507 ≈ 8 MB`，
+/// `recv()` 的 `Vec::with_capacity` 还要再复制一份。
+///
+/// 取 64 KiB：与 `http_relay::MAX_HEAD` 同量级，且**远大于** frp 实际会用
+/// KCP 承载的单条消息（KCP 在这里只是控制连接的传输层，消息都是小 JSON）。
+const MAX_RECV_MSG: usize = 64 * 1024;
+
+/// 报文头长度：conv(4) cmd(1) frg(1) wnd(2) ts(4) sn(4) una(4) len(4)。
+const HEADER: usize = IKCP_OVERHEAD;
+
+// ---------------------------------------------------------------------------
+// 段（ikcp_seg）
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct Seg {
+    conv: u32,
+    cmd: u8,
+    frg: u8,
+    wnd: u16,
+    ts: u32,
+    sn: u32,
+    una: u32,
+    data: Vec<u8>,
+    /// 下次重传的时间戳。
+    resendts: u32,
+    /// 该段的重传超时。
+    rto: u32,
+    /// 被"跳过的 ACK"计数：达到上限就触发快速重传。
+    fastack: u32,
+    /// 已发送次数。
+    xmit: u32,
+}
+
+impl Seg {
+    fn new(data: Vec<u8>) -> Self {
+        Self {
+            conv: 0,
+            cmd: 0,
+            frg: 0,
+            wnd: 0,
+            ts: 0,
+            sn: 0,
+            una: 0,
+            data,
+            resendts: 0,
+            rto: 0,
+            fastack: 0,
+            xmit: 0,
+        }
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.conv.to_le_bytes());
+        out.push(self.cmd);
+        out.push(self.frg);
+        out.extend_from_slice(&self.wnd.to_le_bytes());
+        out.extend_from_slice(&self.ts.to_le_bytes());
+        out.extend_from_slice(&self.sn.to_le_bytes());
+        out.extend_from_slice(&self.una.to_le_bytes());
+        out.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.data);
+    }
+}
+
+/// 从一个数据报里切出所有段（KCP 允许一个 UDP 包里装多个段）。
+fn decode_segs(pkt: &[u8]) -> Result<Vec<Seg>, KcpError> {
+    let mut segs = Vec::new();
+    let mut i = 0usize;
+    while i + HEADER <= pkt.len() {
+        let conv = u32::from_le_bytes(pkt[i..i + 4].try_into().unwrap());
+        let cmd = pkt[i + 4];
+        let frg = pkt[i + 5];
+        let wnd = u16::from_le_bytes(pkt[i + 6..i + 8].try_into().unwrap());
+        let ts = u32::from_le_bytes(pkt[i + 8..i + 12].try_into().unwrap());
+        let sn = u32::from_le_bytes(pkt[i + 12..i + 16].try_into().unwrap());
+        let una = u32::from_le_bytes(pkt[i + 16..i + 20].try_into().unwrap());
+        let len = u32::from_le_bytes(pkt[i + 20..i + 24].try_into().unwrap()) as usize;
+        i += HEADER;
+        if pkt.len() - i < len {
+            return Err(KcpError::Truncated);
+        }
+        // ★ v0.5.6（M10）：**单段数据长度不得超过 MTU**。
+        //
+        // `len` 是 u32 字段，原先只受"实际数据报长度"约束 ——
+        // 一个 65507 字节的 UDP 数据报就能塞进一个 65507 字节的段。
+        // 正常的 KCP 实现里单段 data 绝不会超过 MTU（默认 1400），
+        // 这里按 MTU 收紧，把"用巨段撑爆接收队列"这条路一并堵掉。
+        //
+        // 与 `recv()` 里的总长上限是**两层**：这一层挡住巨段，
+        // 那一层挡住"很多正常段拼成巨消息"。
+        if len > IKCP_MTU_DEF {
+            return Err(KcpError::SegTooLarge {
+                len,
+                mtu: IKCP_MTU_DEF,
+            });
+        }
+        segs.push(Seg {
+            conv,
+            cmd,
+            frg,
+            wnd,
+            ts,
+            sn,
+            una,
+            data: pkt[i..i + len].to_vec(),
+            resendts: 0,
+            rto: 0,
+            fastack: 0,
+            xmit: 0,
+        });
+        i += len;
+    }
+    if segs.is_empty() {
+        return Err(KcpError::TooShort);
+    }
+    Ok(segs)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum KcpError {
+    #[error("KCP 数据报过短")]
+    TooShort,
+    #[error("KCP 数据报被截断")]
+    Truncated,
+    /// v0.5.6（M10）：单段数据长度超过 MTU 上限。
+    #[error("KCP 单段数据 {len} 字节超过 MTU 上限 {mtu}")]
+    SegTooLarge { len: usize, mtu: usize },
+    #[error("KCP 会话号不匹配")]
+    WrongConv,
+    #[error("KCP 连接已断开")]
+    Dead,
+}
+
+// ---------------------------------------------------------------------------
+// KCP 状态机
+// ---------------------------------------------------------------------------
+
+/// 一条 KCP 会话（纯状态机，不碰 IO）。
+///
+/// 调用方负责三件事：定时 [`Kcp::update`]、把收到的 UDP 数据报喂给
+/// [`Kcp::input`]、把 [`Kcp::out`] 里攒下的数据报发出去。
+pub struct Kcp {
+    conv: u32,
+    mss: usize,
+
+    snd_una: u32,
+    snd_nxt: u32,
+    rcv_nxt: u32,
+
+    ssthresh: u32,
+    rx_rttval: u32,
+    rx_srtt: u32,
+    rx_rto: u32,
+    rx_minrto: u32,
+
+    snd_wnd: u32,
+    rcv_wnd: u32,
+    rmt_wnd: u32,
+    cwnd: u32,
+    probe: u32,
+    interval: u32,
+    ts_flush: u32,
+    nodelay: bool,
+    updated: bool,
+    ts_probe: u32,
+    probe_wait: u32,
+    incr: u32,
+    current: u32,
+    /// 被跳过 ACK 多少次就触发快速重传（0 = 关闭）。
+    fastresend: u32,
+
+    snd_queue: VecDeque<Seg>,
+    rcv_queue: VecDeque<Seg>,
+    snd_buf: VecDeque<Seg>,
+    rcv_buf: VecDeque<Seg>,
+    /// 待回的 ACK：`(sn, ts)`。
+    acklist: Vec<(u32, u32)>,
+
+    /// 待发出的 UDP 数据报。调用方取走并发送。
+    pub out: VecDeque<Vec<u8>>,
+    /// 对端被判定为"死链"（重传次数超限）。
+    pub dead: bool,
+}
+
+impl Kcp {
+    pub fn new(conv: u32, mtu: usize) -> Self {
+        let mtu = if mtu == 0 { IKCP_MTU_DEF } else { mtu };
+        Self {
+            conv,
+            mss: mtu - HEADER,
+            snd_una: 0,
+            snd_nxt: 0,
+            rcv_nxt: 0,
+            ssthresh: IKCP_THRESH_INIT,
+            rx_rttval: 0,
+            rx_srtt: 0,
+            rx_rto: IKCP_RTO_DEF,
+            rx_minrto: IKCP_RTO_MIN,
+            snd_wnd: IKCP_WND_SND,
+            rcv_wnd: IKCP_WND_RCV,
+            rmt_wnd: IKCP_WND_RCV,
+            cwnd: 0,
+            probe: 0,
+            interval: IKCP_INTERVAL,
+            ts_flush: IKCP_INTERVAL,
+            nodelay: false,
+            updated: false,
+            ts_probe: 0,
+            probe_wait: 0,
+            incr: 0,
+            current: 0,
+            fastresend: 0,
+            snd_queue: VecDeque::new(),
+            rcv_queue: VecDeque::new(),
+            snd_buf: VecDeque::new(),
+            rcv_buf: VecDeque::new(),
+            acklist: Vec::new(),
+            out: VecDeque::new(),
+            dead: false,
+        }
+    }
+
+    /// 弱网模式：关掉延迟 ACK / 拥塞退让，让重传尽可能激进。
+    ///
+    /// P2P 通道上只有一条业务流，也不需要和别人共享带宽，
+    /// 所以这里默认就把 `nodelay` 打开 —— 这正是选 KCP 而不是 QUIC 的理由。
+    pub fn set_nodelay(&mut self, nodelay: bool, interval: u32, fastresend: u32) {
+        self.nodelay = nodelay;
+        if nodelay {
+            self.rx_minrto = IKCP_RTO_NDL;
+        } else {
+            self.rx_minrto = IKCP_RTO_MIN;
+        }
+        if interval > 0 {
+            self.interval = interval.clamp(1, 5000);
+            self.ts_flush = self.interval;
+        }
+        // 0 表示关闭快速重传
+        self.fastresend = fastresend;
+        self.incr = 0;
+    }
+
+    /// 单段最大载荷。
+    pub fn mss(&self) -> usize {
+        self.mss
+    }
+
+    /// 还有多少字节没被对端确认（写侧积压）。
+    pub fn waitsnd(&self) -> usize {
+        self.snd_buf.len() + self.snd_queue.len()
+    }
+
+    /// 接收队列里已经攒好的字节数。
+    pub fn queued_bytes(&self) -> usize {
+        self.rcv_queue.iter().map(|s| s.data.len()).sum()
+    }
+
+    /// 发送：把一段数据按 `mss` 分片后压入发送队列。
+    ///
+    /// 返回写入的字节数（当前实现要么全写入要么 0）。
+    pub fn send(&mut self, buf: &[u8]) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        let mss = self.mss;
+        // 一条消息被切成 n 片，frg 从 n-1 递减到 0（接收端据此判断消息边界）
+        let count = buf.len().div_ceil(mss);
+        if count > 255 {
+            // 超过 frg 能表达的上限，KCP 无法承载，直接拒绝
+            return 0;
+        }
+        let count = count as u8;
+        for (i, chunk) in buf.chunks(mss).enumerate() {
+            let mut seg = Seg::new(chunk.to_vec());
+            seg.frg = count - 1 - i as u8;
+            self.snd_queue.push_back(seg);
+        }
+        buf.len()
+    }
+
+    /// 定时驱动：推进时间、刷 ACK、必要时重传。
+    pub fn update(&mut self, current: u32) {
+        self.current = current;
+        if !self.updated {
+            self.updated = true;
+            self.ts_flush = current;
+        }
+        // 用 wrapping 差，兼容 u32 回绕；`slap` 很大说明中间隔了很久
+        // （比如任务被暂停过），也要立刻刷一次
+        let mut slap = current.wrapping_sub(self.ts_flush);
+        // 时间倒着走（有人用了墙钟又回拨）时 slap 会是个巨大的数，
+        // 直接按 ikcp 的做法把基准拉回当前时刻，避免误判成"隔了很久"
+        if slap >= 0x8000_0000 {
+            self.ts_flush = current;
+            slap = 0;
+        }
+        if slap >= self.interval || slap >= 10_000 {
+            self.ts_flush = current;
+            self.flush();
+        }
+    }
+
+    /// 立即刷一次（不等定时器），用于刚写完想马上发出去的场景。
+    pub fn flush_now(&mut self, current: u32) {
+        self.current = current;
+        self.flush();
+    }
+
+    /// 收到一个 UDP 数据报。
+    pub fn input(&mut self, pkt: &[u8]) -> Result<(), KcpError> {
+        let segs = decode_segs(pkt)?;
+        for seg in segs {
+            if seg.conv != self.conv {
+                return Err(KcpError::WrongConv);
+            }
+            self.handle_seg(&seg);
+        }
+        Ok(())
+    }
+
+    /// 取出一条完整的应用消息；没有拼完整的就返回 `None`。
+    ///
+    /// ★★ v0.5.6 修（审计总报告 M10，中危）：**接收侧补上消息大小上限**。
+    ///
+    /// # 问题
+    ///
+    /// **发送侧有上限、接收侧没有** —— 又一处"同一语义只加固了一半"：
+    ///
+    /// | 侧 | 代码 | 行为 |
+    /// |---|---|---|
+    /// | 发送 | `encode_segs` 的 `if count > 255 { return 0; }` | 有上限 |
+    /// | 接收 | 本函数 | **无上限** |
+    ///
+    /// 真实上界（审计报告自算，我核对一致）：
+    /// * 队列段数受 `rcv_wnd` 约束，标准值 **128**；
+    /// * 单段 `data` 只受**实际 UDP 数据报**长度约束（≈ 65507 字节）；
+    /// * ⇒ 单会话累计 ≈ **128 × 65507 ≈ 8 MB**，且下面 `Vec::with_capacity`
+    ///   会**再复制一份** ⇒ 峰值约 2×。
+    ///
+    /// 而 `KcpListener::accept` 对**任意源地址**无条件建会话、无鉴权
+    /// （`conv` 由发起方自定）⇒ 攻击者从多个源 IP 各发一个数据报即可
+    /// 建立大量会话，每个都吃掉这些内存。
+    ///
+    /// # 为什么是 Medium 而不是 High（审计报告主动下调，我同意）
+    ///
+    /// 1. **1:1 占用，非放大** —— `rcv_queue` 装的是实际收到的数据，
+    ///    攻击者要占用 8MB 就得真的发 8MB；
+    /// 2. **KCP 默认不启用**（需显式配 `kcpBindPort`）。
+    ///
+    /// # 上限取值
+    ///
+    /// 取 64 KiB，与 `http_relay::MAX_HEAD` 同量级，且**远大于** frp 实际
+    /// 会用 KCP 承载的单条消息（KCP 在这里只是控制连接的传输层，
+    /// 消息都是小 JSON；真正的数据面走工作连接）。
+    /// 超限时**清空接收队列**并返回 `None`：这条流已经不可信，
+    /// 继续拼下去只会让攻击者拿到更多内存。
+    pub fn recv(&mut self) -> Option<Vec<u8>> {
+        // 先确认有一条**完整**的消息（最后一片的 frg == 0）
+        let complete = {
+            let mut total = 0usize;
+            let mut found = false;
+            for s in &self.rcv_queue {
+                // `saturating_add`：段数受 rcv_wnd 约束（不会真的溢出），
+                // 但用饱和加法可以免掉"这里要不要担心溢出"的反复思考。
+                total = total.saturating_add(s.data.len());
+                if s.frg == 0 {
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                Some(total)
+            } else {
+                None
+            }
+        }?;
+
+        // ★ v0.5.6（M10）：超限即丢弃整条流，绝不为它分配内存。
+        if complete > MAX_RECV_MSG {
+            tracing::debug!(
+                size = complete,
+                limit = MAX_RECV_MSG,
+                "KCP 消息超过接收上限，清空接收队列（可能的资源耗尽尝试）"
+            );
+            self.rcv_queue.clear();
+            self.rcv_buf.clear();
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(complete);
+        while let Some(s) = self.rcv_queue.pop_front() {
+            let last = s.frg == 0;
+            out.extend_from_slice(&s.data);
+            if last {
+                break;
+            }
+        }
+        Some(out)
+    }
+
+    // -----------------------------------------------------------------------
+
+    fn handle_seg(&mut self, seg: &Seg) {
+        self.rmt_wnd = seg.wnd as u32;
+
+        // 1) UNA：对端说"这些我都收到了"
+        // UNA 的语义是"我已经收到了 una 之前的**所有**段"，
+        // 所以 sn == una 的那一段**还没被确认**，绝不能一起删掉 ——
+        // 早先这里写成 `> 0`（保留 sn > una），正好把对端最缺的那一段
+        // 当已确认丢出 snd_buf，于是它永远不会被重传，整条流就此卡死。
+        self.snd_buf
+            .retain(|s| i32_from(s.sn.wrapping_sub(seg.una)) >= 0);
+        // snd_una 只能前进（u32 会回绕，不能直接用 max 比大小）
+        if i32_from(seg.una.wrapping_sub(self.snd_una)) > 0 {
+            self.snd_una = seg.una;
+        }
+
+        match seg.cmd {
+            IKCP_CMD_ACK => {
+                // 2) RTT 采样
+                let rtt = self.current.wrapping_sub(seg.ts);
+                if rtt < 0x8000_0000 {
+                    self.update_rtt(rtt);
+                }
+                // 3) 摘掉被确认的那一段，并给它之后的所有段记一次 fastack
+                if let Some(pos) = self.snd_buf.iter().position(|s| s.sn == seg.sn) {
+                    self.snd_buf.remove(pos);
+                }
+                let sn = seg.sn;
+                for s in self.snd_buf.iter_mut() {
+                    if i32_from(s.sn.wrapping_sub(sn)) > 0 {
+                        s.fastack += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            IKCP_CMD_PUSH => {
+                // 4) 落在接收窗口内且是新的 → 收下，排 ACK
+                let sn = seg.sn;
+                if i32_from(sn.wrapping_sub(self.rcv_nxt.wrapping_add(self.rcv_wnd))) < 0
+                    && i32_from(sn.wrapping_sub(self.rcv_nxt)) >= 0
+                {
+                    self.acklist.push((sn, seg.ts));
+                    if i32_from(sn.wrapping_sub(self.rcv_nxt)) >= 0 {
+                        // 按 sn 升序插入 rcv_buf（去重）
+                        if !self.rcv_buf.iter().any(|s| s.sn == sn) {
+                            let mut new = seg.clone();
+                            new.resendts = 0;
+                            let pos = self
+                                .rcv_buf
+                                .iter()
+                                .position(|s| i32_from(s.sn.wrapping_sub(sn)) > 0)
+                                .unwrap_or(self.rcv_buf.len());
+                            self.rcv_buf.insert(pos, new);
+                        }
+                        // 把连续的部分搬到 rcv_queue
+                        while let Some(front) = self.rcv_buf.front() {
+                            if front.sn != self.rcv_nxt
+                                || self.rcv_queue.len() >= self.rcv_wnd as usize
+                            {
+                                break;
+                            }
+                            let s = self.rcv_buf.pop_front().unwrap();
+                            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+                            self.rcv_queue.push_back(s);
+                        }
+                    }
+                }
+            }
+            IKCP_CMD_WASK => self.probe |= IKCP_ASK_TELL,
+            IKCP_CMD_WINS => {}
+            _ => {}
+        }
+    }
+
+    fn update_rtt(&mut self, rtt: u32) {
+        if self.rx_srtt == 0 {
+            self.rx_srtt = rtt;
+            self.rx_rttval = rtt / 2;
+        } else {
+            let delta = (rtt as i32) - (self.rx_srtt as i32);
+            self.rx_srtt = (self.rx_srtt as i32 + delta / 8) as u32;
+            let d = if delta < 0 { -delta } else { delta } as u32;
+            self.rx_rttval =
+                (self.rx_rttval as i32 + (d as i32 - self.rx_rttval as i32) / 4) as u32;
+        }
+        let rto = self.rx_srtt + (self.rx_rttval * 4).max(self.interval);
+        self.rx_rto = rto.max(self.rx_minrto).min(IKCP_RTO_MAX);
+    }
+
+    fn wnd_unused(&self) -> u32 {
+        let queued = self.rcv_queue.len() as u32;
+        self.rcv_wnd.saturating_sub(queued)
+    }
+
+    fn flush(&mut self) {
+        let current = self.current;
+
+        // ---- 1) ACK ----
+        for (sn, ts) in std::mem::take(&mut self.acklist) {
+            let seg = Seg {
+                conv: self.conv,
+                cmd: IKCP_CMD_ACK,
+                frg: 0,
+                wnd: self.wnd_unused() as u16,
+                ts,
+                sn,
+                una: self.rcv_nxt,
+                data: Vec::new(),
+                resendts: 0,
+                rto: 0,
+                fastack: 0,
+                xmit: 0,
+            };
+            self.emit(&seg);
+        }
+
+        // ---- 2) 对端窗口为 0 时定期探测 ----
+        if self.rmt_wnd == 0 {
+            if self.probe_wait == 0 {
+                self.probe_wait = IKCP_PROBE_INIT;
+                self.ts_probe = current + self.probe_wait;
+            } else if i32_from(current.wrapping_sub(self.ts_probe)) >= 0 {
+                self.probe_wait = (self.probe_wait + self.probe_wait / 2).min(IKCP_PROBE_LIMIT);
+                self.ts_probe = current + self.probe_wait;
+                self.probe |= IKCP_ASK_SEND;
+            }
+        } else {
+            self.ts_probe = 0;
+            self.probe_wait = 0;
+        }
+        if self.probe & IKCP_ASK_SEND != 0 {
+            self.emit(&Seg {
+                conv: self.conv,
+                cmd: IKCP_CMD_WASK,
+                frg: 0,
+                wnd: self.wnd_unused() as u16,
+                ts: 0,
+                sn: 0,
+                una: self.rcv_nxt,
+                data: Vec::new(),
+                resendts: 0,
+                rto: 0,
+                fastack: 0,
+                xmit: 0,
+            });
+        }
+        if self.probe & IKCP_ASK_TELL != 0 {
+            self.emit(&Seg {
+                conv: self.conv,
+                cmd: IKCP_CMD_WINS,
+                frg: 0,
+                wnd: self.wnd_unused() as u16,
+                ts: 0,
+                sn: 0,
+                una: self.rcv_nxt,
+                data: Vec::new(),
+                resendts: 0,
+                rto: 0,
+                fastack: 0,
+                xmit: 0,
+            });
+        }
+        self.probe = 0;
+
+        // ---- 3) 拥塞窗口（nodelay 下不生效，P2P 单流不需要退让）----
+        if !self.nodelay {
+            if self.cwnd < self.ssthresh {
+                self.cwnd += 1;
+                self.incr += self.mss as u32;
+            } else {
+                let incr = (self.mss * self.mss) as u32 / self.incr.max(1) + self.mss as u32 / 16;
+                self.incr = 0;
+                self.cwnd = (self.cwnd + incr.max(1)).min(self.rmt_wnd.max(1) * 2);
+            }
+        }
+
+        // 下面的循环要同时改 `snd_buf` 又读其它字段，先把这些值取出来，
+        // 否则借不开（Rust 不允许多次借 `self` 的可变/不可变部分重叠）
+        let wnd = self.wnd_unused() as u16;
+        let rx_rto = self.rx_rto;
+        let nodelay = self.nodelay;
+        let rcv_nxt = self.rcv_nxt;
+        let window = self.snd_wnd.min(self.rmt_wnd);
+        let max_sn = self.snd_una.wrapping_add(window);
+
+        // ---- 4) 把发送队列里的段推进发送缓冲 ----
+        while i32_from(self.snd_nxt.wrapping_sub(max_sn)) < 0 {
+            let Some(mut seg) = self.snd_queue.pop_front() else {
+                break;
+            };
+            seg.conv = self.conv;
+            seg.cmd = IKCP_CMD_PUSH;
+            seg.wnd = wnd;
+            seg.ts = current;
+            seg.sn = self.snd_nxt;
+            seg.una = rcv_nxt;
+            seg.resendts = current;
+            seg.rto = rx_rto;
+            seg.fastack = 0;
+            seg.xmit = 0;
+            self.snd_buf.push_back(seg);
+            self.snd_nxt = self.snd_nxt.wrapping_add(1);
+        }
+
+        // ---- 5) 重传判定 ----
+        // 快速重传阈值；0 表示关闭，此时取 u32::MAX 让比较永不成立。
+        let fast_limit = if self.fastresend > 0 {
+            self.fastresend
+        } else {
+            u32::MAX
+        };
+        // 参与窗口运算时必须是个有限值，否则 `cwnd * mss` 会溢出
+        let resent = self.fastresend.max(1);
+        let rtomin = if nodelay { 0 } else { rx_rto >> 3 };
+        let mut lost = false;
+        let mut change = 0u32;
+        let mut to_emit: Vec<Seg> = Vec::new();
+
+        for seg in self.snd_buf.iter_mut() {
+            let mut needsend = false;
+            if seg.xmit == 0 {
+                needsend = true;
+                seg.xmit += 1;
+                seg.rto = rx_rto;
+                seg.resendts = current + seg.rto + rtomin;
+            } else if i32_from(current.wrapping_sub(seg.resendts)) >= 0 {
+                // 超时重传：RTO 退避（nodelay 下退避得更慢，避免越丢越慢）
+                needsend = true;
+                seg.rto += if nodelay {
+                    seg.rto / 2
+                } else {
+                    seg.rto.max(rx_rto)
+                };
+                seg.xmit += 1;
+                seg.resendts = current + seg.rto;
+                if seg.xmit >= IKCP_DEADLINK_DEFAULT {
+                    lost = true;
+                }
+                change += 1;
+            } else if seg.fastack >= fast_limit {
+                // 快速重传：后面的段都到了就说明这段大概率丢了，不等 RTO
+                needsend = true;
+                seg.fastack = 0;
+                seg.rto = rx_rto;
+                seg.resendts = current + seg.rto;
+                seg.xmit += 1;
+                change += 1;
+            }
+            if needsend {
+                seg.ts = current;
+                seg.wnd = wnd;
+                seg.una = rcv_nxt;
+                to_emit.push(seg.clone());
+            }
+        }
+        for s in &to_emit {
+            self.emit(s);
+        }
+
+        // ---- 6) 收缩窗口 / 判死链 ----
+        if change > 0 && !nodelay {
+            let inflight = self.snd_nxt.wrapping_sub(self.snd_una);
+            self.ssthresh = (inflight / 2).max(IKCP_THRESH_MIN);
+            self.cwnd = self.ssthresh + resent;
+            self.incr = self.cwnd * self.mss as u32;
+        }
+        if lost {
+            self.ssthresh = IKCP_THRESH_MIN;
+            self.cwnd = 1;
+            self.incr = self.mss as u32;
+            self.dead = true;
+        }
+    }
+
+    fn emit(&mut self, seg: &Seg) {
+        let mut buf = Vec::with_capacity(HEADER + seg.data.len());
+        seg.encode(&mut buf);
+        self.out.push_back(buf);
+    }
+}
+
+/// 重传多少次就判定对端已死（ikcp 的 `dead_link`）。
+const IKCP_DEADLINK_DEFAULT: u32 = 20;
+
+/// 把"环绕差"当**有符号**理解（KCP 的 `_itimediff`）。
+fn i32_from(v: u32) -> i32 {
+    v as i32
+}
+
+// ---------------------------------------------------------------------------
+// 异步流封装
+// ---------------------------------------------------------------------------
+
+/// 驱动循环的 tick 间隔：KCP 默认 10ms 一跳。
+const TICK: std::time::Duration = std::time::Duration::from_millis(10);
+/// 单个 UDP 数据报的读缓冲。
+const READ_BUF: usize = 2048;
+
+/// 一条 KCP 数据流（实现 `AsyncRead` + `AsyncWrite`）。
+///
+/// 内部起一个驱动任务：定时 `update`、收发数据报、把拼好的消息交给读端。
+/// `Drop` 时会 abort 驱动任务，socket 随之归还。
+pub struct KcpStream {
+    /// 驱动 → 应用：已经拼完整的应用数据。
+    rx: UnboundedReceiver<Bytes>,
+    /// 上一次取出来但**没读完**的剩余部分。
+    ///
+    /// KCP 一次 `recv` 交出的是一整条应用层消息（可能几 KB），而调用方
+    /// 完全可能只读 1 个字节（服务端探测 yamux 版本字节就是这么干的）。
+    /// 早先这里直接按 `buf.remaining()` 截断、多出来的丢掉 —— 于是 frp 的
+    /// 8 字节魔术字被读走 1 个、丢了 7 个，握手永远等不齐，表现是**静默卡死**。
+    /// 字节流语义必须跟 TcpStream 一致：读多少算多少，剩下的留着下次给。
+    pending: Bytes,
+    /// 应用 → 驱动：待发送的应用数据。
+    tx: UnboundedSender<Bytes>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    /// 独占 socket 时的收包任务（服务端共享端口时没有它）。
+    reader: Option<tokio::task::JoinHandle<()>>,
+    /// 会话结束时回调（服务端用它把对端从会话表里摘掉）。
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for KcpStream {
+    fn drop(&mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+        if let Some(t) = self.reader.take() {
+            t.abort();
+        }
+        if let Some(f) = self.on_drop.take() {
+            f();
+        }
+    }
+}
+
+impl KcpStream {
+    /// 客户端侧：向 `peer` 发起一条 KCP 会话。
+    pub async fn connect(sock: Arc<UdpSocket>, peer: std::net::SocketAddr, conv: u32) -> Self {
+        Self::spawn(sock, peer, conv, None)
+    }
+
+    /// 服务端侧：已经知道对端地址（比如从第一个数据报的源地址学来）。
+    pub fn spawn(
+        sock: Arc<UdpSocket>,
+        peer: std::net::SocketAddr,
+        conv: u32,
+        first: Option<Vec<u8>>,
+    ) -> Self {
+        Self::spawn_candidates(sock, &[peer], conv, first)
+    }
+
+    /// 真正的构造入口：单个或多个候选地址。
+    ///
+    /// 端口预测会给出一串候选端口，而 KCP 是**无连接**的 —— 换目的端口只要
+    /// 换 `send_to` 的地址。所以这里不"每个候选开一条会话"，而是让驱动任务
+    /// 在锁定对端之前**轮流试**每个候选：谁先回包就锁定谁。
+    pub fn spawn_candidates(
+        sock: Arc<UdpSocket>,
+        candidates: &[std::net::SocketAddr],
+        conv: u32,
+        first: Option<Vec<u8>>,
+    ) -> Self {
+        // 独占 socket：起一个收包任务把数据报喂给驱动
+        let (pkt_tx, pkt_rx) = mpsc::unbounded_channel::<(std::net::SocketAddr, Bytes)>();
+        let reader = spawn_reader(Arc::clone(&sock), pkt_tx);
+        Self::drive(sock, candidates, conv, first, pkt_rx, Some(reader), None)
+    }
+
+    /// 服务端（**多个会话共享一个 UDP 端口**）用。
+    ///
+    /// 收包由 [`KcpListener`] 统一做：它按源地址把数据报分派到各会话的
+    /// `pkt_rx`。这里不能让每个会话自己去 `recv_from` —— 多个任务同时读
+    /// 同一个 UDP socket，属于别的会话的数据报会被某个会话"抢到又丢掉"。
+    pub fn spawn_served(
+        sock: Arc<UdpSocket>,
+        peer: std::net::SocketAddr,
+        conv: u32,
+        first: Option<Vec<u8>>,
+        pkt_rx: UnboundedReceiver<(std::net::SocketAddr, Bytes)>,
+        on_drop: Box<dyn FnOnce() + Send>,
+    ) -> Self {
+        Self::drive(sock, &[peer], conv, first, pkt_rx, None, Some(on_drop))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive(
+        sock: Arc<UdpSocket>,
+        candidates: &[std::net::SocketAddr],
+        conv: u32,
+        first: Option<Vec<u8>>,
+        mut pkt_rx: UnboundedReceiver<(std::net::SocketAddr, Bytes)>,
+        reader: Option<tokio::task::JoinHandle<()>>,
+        on_drop: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Self {
+        let mut kcp = Kcp::new(conv, IKCP_MTU_DEF);
+        kcp.set_nodelay(true, IKCP_INTERVAL, IKCP_FASTACK_LIMIT);
+        if let Some(pkt) = first {
+            let _ = kcp.input(&pkt);
+        }
+        let cands: Vec<std::net::SocketAddr> = candidates.to_vec();
+        let fallback: std::net::SocketAddr = "127.0.0.1:0".parse().expect("硬编码地址必然合法");
+        let mut peer = cands.first().copied().unwrap_or(fallback);
+        let (app_tx, app_rx) = mpsc::unbounded_channel();
+        let (net_tx, mut net_rx) = mpsc::unbounded_channel::<Bytes>();
+
+        let task = tokio::spawn(async move {
+            let mut tick = interval(TICK);
+            let start = std::time::Instant::now();
+            let mut idx = 0usize;
+            let mut locked = false;
+            let mut last_switch = std::time::Instant::now();
+            loop {
+                // 先把 KCP 想发的东西全发出去
+                pump(&mut kcp, &sock, &peer).await;
+                tokio::select! {
+                    Some(data) = net_rx.recv() => {
+                        if kcp.send(&data) == 0 { continue; }
+                    }
+                    pkt = pkt_rx.recv() => {
+                        // 数据报来源：独占模式下是自己的收包任务，
+                        // 服务端共享端口模式下是 `KcpListener` 按源地址分派过来的。
+                        let Some((from, data)) = pkt else {
+                            return; // 收包侧没了，这条会话也就结束了
+                        };
+                        // 锁定前：候选列表里谁先回包就认定是谁
+                        // （对称 NAT 下源端口未必等于我们发过去的那个目的端口）。
+                        // 锁定后：洞是敞开的，陌生源一律丢掉。
+                        if locked {
+                            if from != peer { continue; }
+                        } else if let Some(i) = cands.iter().position(|c| *c == from) {
+                            peer = from;
+                            idx = i;
+                            locked = true;
+                        } else {
+                            continue;
+                        }
+                        if kcp.input(&data).is_err() { continue; }
+                        while let Some(msg) = kcp.recv() {
+                            if app_tx.send(Bytes::from(msg)).is_err() { return; }
+                        }
+                    }
+                    _ = tick.tick() => {
+                        kcp.update(ms_since(&start));
+                        if kcp.dead {
+                            debug_dead();
+                            return;
+                        }
+                        // 还没人对答：换下一个候选端口再试一轮
+                        if !locked && cands.len() > 1 && last_switch.elapsed() >= CANDIDATE_SWITCH
+                        {
+                            idx = (idx + 1) % cands.len();
+                            peer = cands[idx];
+                            last_switch = std::time::Instant::now();
+                        }
+                    }
+                }
+                // 应用数据 / ACK 都要尽快落地，不等下一个 tick
+                kcp.update(ms_since(&start));
+                pump(&mut kcp, &sock, &peer).await;
+                while let Some(msg) = kcp.recv() {
+                    if app_tx.send(Bytes::from(msg)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
+        Self {
+            rx: app_rx,
+            pending: Bytes::new(),
+            tx: net_tx,
+            task: Some(task),
+            reader,
+            on_drop,
+        }
+    }
+}
+
+/// 独占 socket 时的收包任务：把收到的每个数据报连同源地址交给驱动。
+fn spawn_reader(
+    sock: Arc<UdpSocket>,
+    tx: UnboundedSender<(std::net::SocketAddr, Bytes)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; READ_BUF];
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok((n, from)) => {
+                    if tx.send((from, Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                        return;
+                    }
+                }
+                Err(e) if transient(&e) => continue,
+                Err(_) => return,
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 服务端监听：一个 UDP 端口上接多条 KCP 会话
+// ---------------------------------------------------------------------------
+
+/// 服务端侧的 KCP 监听（对应官方 frps 的 `kcpBindPort`）。
+///
+/// 与 TCP 不同：一个 UDP 端口要同时服务**多个客户端**，所以收包只能有一个
+/// 地方做 —— 这里统一 `recv_from`，再按源地址把数据报分派给对应会话。
+/// 要是让每条会话各自 `recv_from`，属于别人的数据报会被某条会话"抢到又丢掉"，
+/// 症状是客户端随机卡死、极难复现。
+/// 一条会话的收包队列：`KcpListener` 往这里投递属于该会话的数据报。
+type SessionTx = UnboundedSender<(std::net::SocketAddr, Bytes)>;
+/// 源地址 → 会话收包队列。
+type SessionTable = Arc<std::sync::Mutex<HashMap<std::net::SocketAddr, SessionTx>>>;
+
+/// ★★ v0.5.9 新增（第九轮审计 **C9-1**，中危）：**KCP 会话表的条数上限**。
+///
+/// # 为什么必须有
+///
+/// `KcpListener::accept` 对**任意 UDP 源地址/端口**无条件建会话
+/// （会话表的键是 `from`，**含源端口**），而且**没有任何条数上限**。
+/// 每个会话要占：HashMap 条目 + 一条 tokio task + 一个 unbounded channel + 缓冲区。
+///
+/// # 实测（`tmp/audit9/c/c9_1b_kcp_cost.py` / `c9_1c_decisive.py`）
+///
+/// 单会话成本 ≈ **15.3 KB**，成本曲线**严格线性、无拐点**：
+///
+/// | 会话数 | 峰值内存 | 每会话 |
+/// |---|---|---|
+/// | 1000 | 23.4 MB | 16.6 KB |
+/// | 5000 | 82.7 MB | 15.5 KB |
+/// | 15080 | **233.2 MB** | 15.3 KB |
+///
+/// 持续灌 20 秒（每包 **25 字节**）：
+///
+/// ```text
+/// 上行 757 KB（31000 个包）⇒ 内存峰值 238.0 MB（增量 +230.7 MB）
+/// ★ 放大比 = 312×（1 字节上行 → 312 字节内存）
+/// ```
+///
+/// ⇒ **一个 25 字节的 UDP 包换来 15 KB 内存，放大 312 倍。**
+///   服务端不会崩溃（`alive=True`），危害是**内存耗尽**。
+///
+/// # ★ 代码注释原先的定级依据是错的
+///
+/// 上面 `rcv_queue` 那段注释写着「**1:1 占用，非放大** —— 攻击者要占用 8MB
+/// 就得真的发 8MB」。那个算法只算了"会话里堆的数据"（确实是 1:1），
+/// **漏掉了会话本身的开销**。实测放大比是 312×，不是 1:1。
+///
+/// 真正让它是"中危而非高危"的理由是**另一条**：**KCP 默认不启用**
+/// （需显式配 `kcpBindPort`）。这一条注释写对了，但第一条论据必须更正。
+///
+/// # 取值
+///
+/// 1024。理由：
+/// * 正常部署里 "同时有 1024 条 KCP 控制连接" 已经远超任何真实规模
+///   （KCP 只是控制连接的传输层，一条客户端一条连接）；
+/// * 1024 × 15.3 KB ≈ **15 MB** 峰值，可接受；
+/// * 超限时**丢弃新会话**（不回包）—— 让发起方按 KCP 自己的重传超时放弃，
+///   不引入新的协议语义。
+///
+/// ★ 为什么**不**按源 IP 限：同一 NAT 后面可能有多个合法客户端，
+///   按 IP 限会误伤。按**总量**限才只影响"超出容量的那部分"。
+pub const MAX_KCP_SESSIONS: usize = 1024;
+
+/// 会话表上限的**安全下限**。
+///
+/// 这个值直接决定内存上界（`max × 15.3 KB`），配得过低会让 KCP 立刻不可用：
+/// 第 N+1 条连接会被静默丢弃，表现为"配了 KCP 但客户端连不上"。
+/// 64 条 ≈ 1 MB 峰值，是任何真实部署都够用的最小值。
+pub const MIN_KCP_SESSIONS: usize = 64;
+
+/// ★ v0.5.9 收尾（C9-1）：会话表打满后"丢弃新会话"日志的折叠器。
+///
+/// 该分支**按被丢弃的数据报数触发**、与 `max_sessions` **无关** —— 不折叠
+/// 就能被未认证对手以灌包速率无限刷 debug 日志。与 A-1 的连接失败日志
+/// 同一套工具：每窗口配额 + 压制计数汇总。
+static KCP_DROP_LOG: RateLimited = RateLimited::with_reporting(5, Duration::from_secs(10));
+
+pub struct KcpListener {
+    sock: Arc<UdpSocket>,
+    /// 源地址 → 该会话的收包队列。
+    sessions: SessionTable,
+    /// 会话表条数上限（见 [`MAX_KCP_SESSIONS`]）。
+    max_sessions: usize,
+}
+
+impl KcpListener {
+    pub async fn bind(addr: std::net::SocketAddr) -> std::io::Result<Self> {
+        let sock = UdpSocket::bind(addr).await?;
+        Ok(Self {
+            sock: Arc::new(sock),
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            max_sessions: MAX_KCP_SESSIONS,
+        })
+    }
+
+    /// ★ v0.5.9（C9-1）：覆盖会话数上限（测试与特殊部署用）。
+    ///
+    /// ★ v0.6.2：加**安全下限**。这个值直接决定内存上界
+    /// （`max × 15.3 KB`），配成 0 或极小值会让 KCP 完全不可用 ——
+    /// 那是"服务静默失效"，比拒绝启动更危险。
+    /// 低于 [`MIN_KCP_SESSIONS`] 时抬到下限并告警，而不是照用。
+    pub fn with_max_sessions(mut self, max: usize) -> Self {
+        if max < MIN_KCP_SESSIONS {
+            tracing::warn!(
+                requested = max,
+                floor = MIN_KCP_SESSIONS,
+                "KCP 会话上限配置过低，已抬到安全下限（0 会让 KCP 完全不可用）"
+            );
+            self.max_sessions = MIN_KCP_SESSIONS;
+        } else {
+            self.max_sessions = max;
+        }
+        self
+    }
+
+    /// 当前会话数上限（面板 / 日志用）。
+    pub fn max_sessions(&self) -> usize {
+        self.max_sessions
+    }
+
+    /// 测试专用：**绕过安全下限**直接设上限。
+    ///
+    /// 为什么需要它：测"上限真的会丢弃超额会话"必须用一个很小的值
+    /// （否则要造几百个源端口），而 `with_max_sessions` 会把小值抬到
+    /// 下限 64 —— 那时这条测试就测不到"超额被拒"这个行为了。
+    ///
+    /// 生产路径只用 `with_max_sessions`，下限对配置始终生效。
+    #[cfg(test)]
+    pub fn force_max_sessions_for_test(mut self, max: usize) -> Self {
+        self.max_sessions = max;
+        self
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.sock.local_addr()
+    }
+
+    /// 接一条新会话：等到某个**新的**源地址发来它的第一个 KCP 数据报。
+    ///
+    /// 老会话的数据报在这里直接转发，不会返回。
+    pub async fn accept(&self) -> std::io::Result<(KcpStream, std::net::SocketAddr)> {
+        let mut buf = vec![0u8; READ_BUF];
+        loop {
+            let (n, from) = self.sock.recv_from(&mut buf).await?;
+            // 连 KCP 头（24 字节）都不够，肯定不是 KCP 数据报，丢掉
+            if n < HEADER {
+                continue;
+            }
+            let existing = {
+                let g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                g.get(&from).cloned()
+            };
+            if let Some(tx) = existing {
+                if tx.send((from, Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                    // 驱动已经退出但还没来得及摘掉：顺手清理，下一轮重新认作新会话
+                    let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    g.remove(&from);
+                }
+                continue;
+            }
+            // 新会话：conv 由发起方定，从报文头读出来照抄即可
+            let conv = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let (tx, rx) = mpsc::unbounded_channel();
+            {
+                let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                // ★★ v0.5.9 修（第九轮审计 **C9-1**，中危）：**会话表必须封顶**。
+                //
+                // 超过上限时**丢弃这个数据报**（不回包、不建会话）：
+                // * 让发起方按 KCP 自己的重传超时放弃，不引入新的协议语义；
+                // * **不动已有会话** —— 上限满了不影响正在服务的那些连接；
+                // * 不按源 IP 限（同一 NAT 后可能有多个合法客户端，按 IP 会误伤）。
+                //
+                // 实测依据见 [`MAX_KCP_SESSIONS`] 的文档注释：
+                // 单会话 ≈ 15.3 KB，25 字节的包换 15 KB 内存，**放大 312×**。
+                if g.len() >= self.max_sessions {
+                    // 与"非 KCP 数据报"同一处理：静默丢弃（不回包）。
+                    //
+                    // ★ v0.5.9 订正：这条路径**按被丢弃的数据报数触发**、与
+                    // `max_sessions` 无关 —— 原先自注"日志量受 max_sessions
+                    // 约束"不成立，未认证对手保持灌包就能无限刷 debug 日志。
+                    // 已改用 `RateLimited` 折叠（配额 + 压制计数汇总）。
+                    let (ok, suppressed) = KCP_DROP_LOG.allow_with_metadata();
+                    if ok {
+                        tracing::debug!(
+                            sessions = g.len(),
+                            limit = self.max_sessions,
+                            suppressed,
+                            %from,
+                            "KCP 会话数已达上限，丢弃新会话的建连请求"
+                        );
+                    }
+                    continue;
+                }
+                g.insert(from, tx);
+            }
+            let sessions = Arc::clone(&self.sessions);
+            let stream = KcpStream::spawn_served(
+                Arc::clone(&self.sock),
+                from,
+                conv,
+                Some(buf[..n].to_vec()),
+                rx,
+                Box::new(move || {
+                    let mut g = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    g.remove(&from);
+                }),
+            );
+            return Ok((stream, from));
+        }
+    }
+}
+
+/// 还没锁定对端时，多久换一个候选端口试。
+const CANDIDATE_SWITCH: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// 这个收包错误是"可以当没发生"的吗？
+///
+/// Windows 上**必须**做这个判断：往一个没开端口发 UDP（打洞时再正常不过 ——
+/// 预测出来的候选端口大部分就是空的），对端回一个 ICMP 不可达，
+/// 系统会在**下一次** `recv_from` 上报 `WSAECONNRESET`。
+/// 早先这里不分青红皂白 `return`，于是打洞过程中的一发空包
+/// 就把整条 KCP 通道干掉了。
+fn transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
+fn debug_dead() {
+    tracing::debug!("KCP 判定对端为死链，关闭通道");
+}
+
+fn ms_since(start: &std::time::Instant) -> u32 {
+    start.elapsed().as_millis() as u32
+}
+
+async fn pump(kcp: &mut Kcp, sock: &UdpSocket, peer: &std::net::SocketAddr) {
+    while let Some(pkt) = kcp.out.pop_front() {
+        if sock.send_to(&pkt, peer).await.is_err() {
+            break;
+        }
+    }
+}
+
+impl AsyncRead for KcpStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        // 上次没读完的先给（字节流语义：不丢、不重排）
+        if !self.pending.is_empty() {
+            let n = self.pending.len().min(buf.remaining());
+            buf.put_slice(&self.pending[..n]);
+            self.pending = self.pending.slice(n..);
+            return std::task::Poll::Ready(Ok(()));
+        }
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(bytes)) => {
+                let n = bytes.len().min(buf.remaining());
+                buf.put_slice(&bytes[..n]);
+                // 剩下的留到下次，绝不能丢
+                self.pending = bytes.slice(n..);
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())), // EOF
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for KcpStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.tx.send(Bytes::copy_from_slice(buf)) {
+            Ok(()) => std::task::Poll::Ready(Ok(buf.len())),
+            Err(_) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "KCP 通道已关闭",
+            ))),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// 由 sid 派生一个会话号（两端各自算，结果必须一致）。
+pub fn conv_from_sid(sid: &str) -> u32 {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(sid.as_bytes());
+    u32::from_be_bytes([h[0], h[1], h[2], h[3]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一段可控的"虚拟链路"：两端各有一组待发数据报，可按比例丢包。
+    struct Wire {
+        loss: u32, // 千分之几
+        rng: u64,
+    }
+
+    impl Wire {
+        fn new(loss_permille: u32) -> Self {
+            Self {
+                loss: loss_permille,
+                rng: 0x1234_5678,
+            }
+        }
+        /// 简易 xorshift，避免引入 rand 依赖。
+        fn next(&mut self) -> u32 {
+            let mut x = self.rng as u32;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.rng = x as u64;
+            x
+        }
+        fn drop_it(&mut self) -> bool {
+            self.next() % 1000 < self.loss
+        }
+    }
+
+    /// 在一条会丢包的链路两端跑 KCP，直到 `data` 全部送达。
+    fn transfer(loss_permille: u32, data: &[u8]) -> Vec<u8> {
+        let mut a = Kcp::new(1, IKCP_MTU_DEF);
+        let mut b = Kcp::new(1, IKCP_MTU_DEF);
+        a.set_nodelay(true, IKCP_INTERVAL, IKCP_FASTACK_LIMIT);
+        b.set_nodelay(true, IKCP_INTERVAL, IKCP_FASTACK_LIMIT);
+
+        let mut wire = Wire::new(loss_permille);
+        let mut got = Vec::new();
+        let mut to_b: Vec<Vec<u8>> = Vec::new();
+        let mut to_a: Vec<Vec<u8>> = Vec::new();
+
+        assert_eq!(a.send(data), data.len(), "发送应当整段收下");
+
+        for step in 0..200_000u32 {
+            let now = step * 10;
+            a.update(now);
+            b.update(now);
+            // 搬运（带丢包）
+            for p in a.out.drain(..) {
+                if !wire.drop_it() {
+                    to_b.push(p);
+                }
+            }
+            for p in b.out.drain(..) {
+                if !wire.drop_it() {
+                    to_a.push(p);
+                }
+            }
+            for p in to_b.drain(..) {
+                let _ = b.input(&p);
+            }
+            for p in to_a.drain(..) {
+                let _ = a.input(&p);
+            }
+            while let Some(m) = b.recv() {
+                got.extend_from_slice(&m);
+            }
+            if got.len() >= data.len() {
+                break;
+            }
+        }
+        got
+    }
+
+    #[test]
+    fn segment_header_roundtrip() {
+        let seg = Seg {
+            conv: 0xdead_beef,
+            cmd: IKCP_CMD_PUSH,
+            frg: 3,
+            wnd: 32,
+            ts: 12345,
+            sn: 7,
+            una: 6,
+            data: b"hello".to_vec(),
+            resendts: 0,
+            rto: 0,
+            fastack: 0,
+            xmit: 0,
+        };
+        let mut buf = Vec::new();
+        seg.encode(&mut buf);
+        assert_eq!(buf.len(), HEADER + 5);
+        let back = decode_segs(&buf).unwrap();
+        assert_eq!(back.len(), 1);
+        let s = &back[0];
+        assert_eq!(s.conv, seg.conv);
+        assert_eq!(s.cmd, seg.cmd);
+        assert_eq!(s.frg, seg.frg);
+        assert_eq!(s.sn, seg.sn);
+        assert_eq!(s.una, seg.una);
+        assert_eq!(&s.data, b"hello");
+    }
+
+    #[test]
+    fn multiple_segments_in_one_datagram() {
+        let mut buf = Vec::new();
+        for i in 0..3u8 {
+            let mut s = Seg::new(vec![i; 4]);
+            s.sn = i as u32;
+            s.encode(&mut buf);
+        }
+        let segs = decode_segs(&buf).unwrap();
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[2].sn, 2);
+    }
+
+    #[test]
+    fn truncated_datagram_is_rejected() {
+        let mut s = Seg::new(vec![1, 2, 3, 4]);
+        s.cmd = IKCP_CMD_PUSH;
+        let mut buf = Vec::new();
+        s.encode(&mut buf);
+        buf.pop();
+        assert!(matches!(decode_segs(&buf), Err(KcpError::Truncated)));
+    }
+
+    #[test]
+    fn reliable_over_perfect_link() {
+        let data = vec![0xab_u8; 5000];
+        assert_eq!(transfer(0, &data).len(), data.len());
+    }
+
+    /// 核心卖点：30% 丢包下仍然能把数据送完，且内容一致。
+    #[test]
+    fn reliable_over_very_lossy_link() {
+        let data: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let got = transfer(300, &data);
+        assert_eq!(
+            got.len(),
+            data.len(),
+            "30% 丢包下必须仍然可靠送达（实际 {} / {}）",
+            got.len(),
+            data.len()
+        );
+        assert_eq!(got, data, "内容必须逐字节一致");
+    }
+
+    /// 5% 丢包（典型弱网）下要能扛住。
+    #[test]
+    fn reliable_over_mildly_lossy_link() {
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i % 97) as u8).collect();
+        let got = transfer(50, &data);
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn small_messages_are_framed() {
+        // 三条短消息必须各自独立成帧，不能被粘成一条
+        let mut a = Kcp::new(9, IKCP_MTU_DEF);
+        let mut b = Kcp::new(9, IKCP_MTU_DEF);
+        a.send(b"aaa");
+        a.send(b"bbbb");
+        a.send(b"c");
+        let mut to_b = Vec::new();
+        for step in 0..100u32 {
+            let now = step * 10;
+            a.update(now);
+            b.update(now);
+            to_b.extend(a.out.drain(..));
+            let batch: Vec<_> = std::mem::take(&mut to_b);
+            for p in batch {
+                let _ = b.input(&p);
+            }
+        }
+        assert_eq!(b.recv().as_deref(), Some(&b"aaa"[..]));
+        assert_eq!(b.recv().as_deref(), Some(&b"bbbb"[..]));
+        assert_eq!(b.recv().as_deref(), Some(&b"c"[..]));
+        assert!(b.recv().is_none(), "没有更多消息了");
+    }
+
+    #[test]
+    fn wrong_conv_is_rejected() {
+        let mut a = Kcp::new(1, IKCP_MTU_DEF);
+        let mut b = Kcp::new(2, IKCP_MTU_DEF);
+        a.send(b"x");
+        // 第一次 update 只是把时间基准对齐（ikcp 的行为），要立刻刷一帧得用
+        // flush_now —— 否则这里拿到的是空队列
+        a.flush_now(0);
+        let pkt = a.out.pop_front().unwrap();
+        assert!(matches!(b.input(&pkt), Err(KcpError::WrongConv)));
+    }
+
+    #[test]
+    fn conv_from_sid_is_stable_and_shared() {
+        assert_eq!(conv_from_sid("sid-1"), conv_from_sid("sid-1"));
+        assert_ne!(conv_from_sid("sid-1"), conv_from_sid("sid-2"));
+    }
+
+    /// ★★ v0.5.9 回归（第九轮审计 **C9-1**，中危）：**KCP 会话表必须封顶。**
+    ///
+    /// # 原先的洞
+    ///
+    /// `accept()` 对**任意 UDP 源地址/端口**无条件 `sessions.insert(from, tx)`，
+    /// **没有条数上限**。而单会话成本 ≈ 15.3 KB。
+    ///
+    /// 实测（`tmp/audit9/c/c9_1c_decisive.py`）：
+    /// * 上行 **757 KB**（31000 个 25 字节的包）⇒ 内存峰值 **238.0 MB**
+    /// * **放大比 312×**
+    ///
+    /// ★ `rcv_queue` 那段注释说「**1:1 占用，非放大**」，那个算法只算了
+    ///   "会话里堆的数据"，**漏掉了会话本身的开销**（HashMap 条目 + task + channel）。
+    ///
+    /// # 这条测试的做法（**踩过两次坑才写对**）
+    ///
+    /// 坑 1：第一版把 `accept()` 包在 `tokio::spawn` + `timeout` 里等 500ms，
+    ///       结果会话数是 0 —— 是**测试没跑通**，不是上限有效。
+    /// 坑 2：第二版逐轮驱动 `accept()` 并计数，但**丢掉了返回的 `KcpStream`**
+    ///       ⇒ 它的 `Drop` 立刻把会话从表里移除（诊断输出 `established=24
+    ///       sessions_len=0`）⇒ 永远观察不到会话表，退回上限也「测试仍绿」。
+    ///
+    /// ⇒ 第三版：**持有所有 `KcpStream`**，会话才会留在表里。
+    ///   这是"退回验证抓到测试测错了对象"的第三次出现。
+    #[tokio::test]
+    async fn kcp_会话表必须有上限() {
+        // 用小上限便于测（真实默认是 MAX_KCP_SESSIONS = 1024）
+        const LIMIT: usize = 8;
+        // ★ 只多送 4 个：超出的那几个会让 `accept()` 超时，
+        //   每超时一次要等 1 秒 ⇒ 不能送太多（送 3× 会让测试跑 16 秒）。
+        const SENDS: usize = LIMIT + 4;
+
+        let listener = Arc::new(
+            KcpListener::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap()
+                // ★ v0.6.2：用 force_* 绕开安全下限。
+                //   with_max_sessions 会把 8 抬到 MIN_KCP_SESSIONS=64，
+                //   那样这条测试永远造不满会话表，也就测不到
+                //   "超额会被丢弃"这个核心行为。
+                .force_max_sessions_for_test(LIMIT),
+        );
+        let listen_addr = listener.local_addr().unwrap();
+
+        // 预先造好 SENDS 个"客户端"（每个一个独立源端口）
+        let mut clients = Vec::new();
+        for i in 0..SENDS {
+            let sk = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let pkt = {
+                let mut h = Kcp::new(0x4000_0000 + i as u32, IKCP_MTU_DEF);
+                h.send(b"X");
+                h.flush_now(0);
+                h.out.pop_front().unwrap()
+            };
+            clients.push((sk, pkt));
+        }
+
+        // 逐个发，每发一个就跑一轮 accept。
+        // ★★ 必须**持有**返回的 KcpStream —— 它一 Drop 会话就被摘掉。
+        //
+        // ★ 时序容错：`accept()` 的超时不能太紧。
+        //   实测 200ms 在机器繁忙时不够（同一份代码 4.0s 过、0.75s 挂 —— 时序抖动），
+        //   所以给到 1 秒。一个包**只对应一次** accept 机会：
+        //   能建就建（拿流并持有），被上限挡住就超时（那正是我们要观察的）。
+        let mut held: Vec<KcpStream> = Vec::new();
+        for (sk, pkt) in &clients {
+            let _ = sk.send_to(pkt, listen_addr).await;
+            if let Ok(Ok((stream, _addr))) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                Arc::clone(&listener).accept(),
+            )
+            .await
+            {
+                held.push(stream);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let n = {
+            let g = listener.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            g.len()
+        };
+
+        // ---- ① 上限内确实建成了会话（防止假绿）----
+        assert!(
+            held.len() >= LIMIT,
+            "★ 上限内应当能建成至少 {LIMIT} 条会话（实际 {}）—— \
+             若这里是 0/极少，说明测试没跑通，不是上限生效",
+            held.len()
+        );
+
+        // ---- ② 核心：会话数不得超过上限 ----
+        assert!(
+            n <= LIMIT,
+            "★ KCP 会话数**不得超过**上限 {LIMIT} —— 实际 {n}（持有 {} 条流）。\
+             原先无上限：实测 31000 个 25 字节的包即可把内存推到 238 MB（放大 312×）",
+            held.len()
+        );
+
+        // ---- ③ 默认值合理 ----
+        assert!(
+            (64..=65536).contains(&MAX_KCP_SESSIONS),
+            "默认上限应当是个合理值（当前 {MAX_KCP_SESSIONS}）"
+        );
+        drop(held);
+    }
+
+    /// ★ v0.6.2 回归：会话上限有**安全下限**，配成 0 不会把 KCP 关掉。
+    ///
+    /// 这个值直接决定内存上界（`max × 15.3 KB`）。如果允许配 0 并照用，
+    /// 表现就是"第 1 条连接就被丢弃" —— KCP 完全不可用，而进程不报错。
+    /// 那种"静默失效"比拒绝启动更难排查。
+    #[tokio::test]
+    async fn kcp_session_cap_has_a_floor() {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        // ① 配 0：抬到下限，而不是关掉 KCP
+        let l = KcpListener::bind(addr)
+            .await
+            .expect("绑定应当成功")
+            .with_max_sessions(0);
+        assert_eq!(
+            l.max_sessions(),
+            MIN_KCP_SESSIONS,
+            "配 0 必须抬到安全下限 {MIN_KCP_SESSIONS}，否则 KCP 会静默不可用"
+        );
+
+        // ② 配得比下限还小：同样抬上去
+        let l2 = KcpListener::bind(addr)
+            .await
+            .expect("绑定应当成功")
+            .with_max_sessions(1);
+        assert_eq!(l2.max_sessions(), MIN_KCP_SESSIONS, "低于下限也要抬上去");
+
+        // ③ 正常值原样保留
+        let l3 = KcpListener::bind(addr)
+            .await
+            .expect("绑定应当成功")
+            .with_max_sessions(4096);
+        assert_eq!(l3.max_sessions(), 4096, "正常配置不该被改动");
+
+        // ④ 下限本身要合理：内存上界 = 值 × 15.3 KB，64 条约 1 MB
+        assert!(
+            (32..=4096).contains(&MIN_KCP_SESSIONS),
+            "下限本身要是个合理值（当前 {MIN_KCP_SESSIONS}），\
+             太小 KCP 不可用，太大会让「配错」变成内存风险"
+        );
+    }
+
+    #[test]
+    fn oversized_message_is_refused() {
+        let mut k = Kcp::new(1, IKCP_MTU_DEF);
+        // mss = 1400-24 = 1376，1376*256 片超过 frg 上限
+        let big = vec![0u8; k.mss() * 256];
+        assert_eq!(k.send(&big), 0, "分片数超过 255 时必须拒绝而不是静默截断");
+    }
+
+    #[tokio::test]
+    async fn kcp_stream_roundtrip_over_loopback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let srv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = srv.local_addr().unwrap();
+        let cli = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let conv = conv_from_sid("unit-test");
+        let server = tokio::spawn(async move {
+            let mut buf = vec![0u8; READ_BUF];
+            let (n, from) = srv.recv_from(&mut buf).await.unwrap();
+            let mut s = KcpStream::spawn(Arc::new(srv), from, conv, Some(buf[..n].to_vec()));
+            let mut got = vec![0u8; 4];
+            s.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"ping");
+            s.write_all(b"pong").await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            got
+        });
+
+        // 客户端要先说一句话，服务端才能从数据报里学到地址
+        let mut c = KcpStream::connect(Arc::new(cli), srv_addr, conv).await;
+        c.write_all(b"ping").await.unwrap();
+        let mut reply = vec![0u8; 4];
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.read_exact(&mut reply))
+            .await
+            .expect("KCP 往返超时")
+            .unwrap();
+        assert_eq!(&reply, b"pong");
+        server.await.unwrap();
+    }
+
+    /// 一个 UDP 端口上要能同时接多条会话 —— 这是 `kcpBindPort` 的前提。
+    ///
+    /// 收包只能在 `KcpListener` 一处做：让每条会话各自 `recv_from` 同一个
+    /// socket，属于别的会话的数据报会被"抢到又丢掉"，症状是随机卡死。
+    #[tokio::test]
+    async fn kcp_listener_serves_two_sessions_on_one_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let ln = KcpListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = ln.local_addr().unwrap();
+
+        // 服务端：接两条会话，各自回一个 pong
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _peer) = ln.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4];
+                    if s.read_exact(&mut buf).await.is_ok() {
+                        let _ = s.write_all(b"pong").await;
+                        // 会话必须活到对端收完回包
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+
+        for conv in [0x1122u32, 0x3344u32] {
+            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let mut c = KcpStream::connect(sock, addr, conv).await;
+            c.write_all(b"ping").await.unwrap();
+            let mut reply = [0u8; 4];
+            tokio::time::timeout(std::time::Duration::from_secs(5), c.read_exact(&mut reply))
+                .await
+                .expect("KCP 往返超时：两条会话共用一个 UDP 端口时数据被错领了？")
+                .unwrap();
+            assert_eq!(&reply, b"pong");
+        }
+        server.await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // v0.5.6 回归（审计总报告 M10）：接收侧消息大小上限
+    // ------------------------------------------------------------------
+
+    /// 造一个指定 `len` 字段的数据报（data 按需填充，用于测解码层）。
+    fn raw_seg(len: u32) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u32.to_le_bytes()); // conv
+        p.push(IKCP_CMD_PUSH); // cmd
+        p.push(0); // frg
+        p.extend_from_slice(&128u16.to_le_bytes()); // wnd
+        p.extend_from_slice(&0u32.to_le_bytes()); // ts
+        p.extend_from_slice(&0u32.to_le_bytes()); // sn
+        p.extend_from_slice(&0u32.to_le_bytes()); // una
+        p.extend_from_slice(&len.to_le_bytes()); // len
+        p.resize(HEADER + len as usize, 0xAA);
+        p
+    }
+
+    /// ★★ M10 之一：**解码层拒绝超过 MTU 的单段**。
+    ///
+    /// 原先 `len` 只受"实际数据报长度"约束 ⇒ 一个 65507 字节的 UDP 数据报
+    /// 就能塞进一个 65507 字节的段（正常 KCP 单段绝不会超过 MTU）。
+    #[test]
+    fn 解码必须拒绝超过_mtu_的段() {
+        // 正常大小照常通过
+        assert!(decode_segs(&raw_seg(1400)).is_ok(), "MTU 大小应通过");
+        assert!(decode_segs(&raw_seg(1)).is_ok());
+
+        // 超过 MTU ⇒ 拒绝
+        let e = decode_segs(&raw_seg(IKCP_MTU_DEF as u32 + 1)).unwrap_err();
+        assert!(
+            matches!(e, KcpError::SegTooLarge { .. }),
+            "应报 SegTooLarge，实际：{e:?}"
+        );
+        // 审计报告里那个"一个 UDP 数据报塞满"的极端值
+        assert!(
+            decode_segs(&raw_seg(65507)).is_err(),
+            "65507 字节的单段必须拒"
+        );
+    }
+
+    /// ★★ M10 之二：**接收队列拼接超过上限时清空并丢弃**。
+    ///
+    /// 与上一条是两层：那条挡巨段，这条挡"很多正常段拼成巨消息"
+    /// （`rcv_wnd(128) × 65507 ≈ 8 MB`，`with_capacity` 还要再复制一份）。
+    #[test]
+    fn 接收拼接超限必须丢弃整条流() {
+        let mut s = Kcp::new(1, 0);
+
+        // 塞进若干"正常大小"的段，累计超过 MAX_RECV_MSG
+        let chunk = vec![0xAAu8; 1400];
+        let need = MAX_RECV_MSG / chunk.len() + 2;
+        for i in 0..need {
+            s.rcv_queue.push_back(Seg {
+                conv: 1,
+                cmd: IKCP_CMD_PUSH,
+                // 除最后一片外都置 frg=1（还有后续片）
+                frg: if i + 1 == need { 0 } else { 1 },
+                wnd: 128,
+                ts: 0,
+                sn: i as u32,
+                una: 0,
+                data: chunk.clone(),
+                resendts: 0,
+                rto: 0,
+                fastack: 0,
+                xmit: 0,
+            });
+        }
+        let pushed = s.rcv_queue.len();
+        assert!(pushed * chunk.len() > MAX_RECV_MSG, "前置：累计确实超限");
+
+        assert!(
+            s.recv().is_none(),
+            "超限的消息必须被丢弃（返回 None），不能真的分配那么多内存"
+        );
+        assert!(s.rcv_queue.is_empty(), "超限后接收队列必须清空");
+        assert!(s.rcv_buf.is_empty(), "乱序缓冲也要清空");
+    }
+
+    /// 反向：正常大小的消息照常收得到（别修得过头）。
+    #[test]
+    fn 正常大小消息仍然收得到() {
+        let mut s = Kcp::new(1, 0);
+        for (i, part) in [&b"hello "[..], &b"world"[..]].iter().enumerate() {
+            s.rcv_queue.push_back(Seg {
+                conv: 1,
+                cmd: IKCP_CMD_PUSH,
+                frg: if i == 1 { 0 } else { 1 },
+                wnd: 128,
+                ts: 0,
+                sn: i as u32,
+                una: 0,
+                data: part.to_vec(),
+                resendts: 0,
+                rto: 0,
+                fastack: 0,
+                xmit: 0,
+            });
+        }
+        assert_eq!(s.recv().as_deref(), Some(&b"hello world"[..]));
+    }
+}

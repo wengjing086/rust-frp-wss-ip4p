@@ -1,0 +1,48 @@
+[package]
+name = "nfrp-server"
+description = "NFrp 服务端：控制连接 + 工作连接，TCP 端口转发"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"   # 用本 crate 的 README（根 README 含相对路径，crates.io 上会破图）
+keywords = ["frp", "proxy", "tunnel", "server", "nat"]
+categories = ["network-programming"]
+
+[[bin]]
+name = "nfrp-server"
+path = "src/main.rs"
+
+[dependencies]
+quinn = { workspace = true }
+base64.workspace = true
+nfrp-common = { workspace = true }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+russh = { workspace = true }
+# 与 russh 0.60 内部使用的 rand_core 保持同一主版本，
+# 否则 PrivateKey::random 要求的 CryptoRng trait 对不上。
+# rand 0.10 提供 OsRng（O.10 的 rand_core 只有 trait），
+# 与 russh 0.60 内部的 rand_core 主版本一致。
+rand010 = { package = "rand", version = "0.10", default-features = false, features = ["sys_rng"] }
+rand = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+
+[lib]
+name = "nfrp_server"
+path = "src/lib.rs"
+
+[dev-dependencies]
+quinn = { workspace = true }
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }

@@ -1,0 +1,310 @@
+# ============================================================
+# frps 配置（NFrp 实现，兼容原版 frp 的 v1 / v2 线协议）
+# 用法： frps -c frps.toml
+# 生成： frps --gen-config frps.toml   （打印这份带注释的模板）
+# ============================================================
+
+# ---- 基础 ----
+bind_addr = "0.0.0.0"
+# 控制连接与工作连接复用同一个端口（与原版 frp 一致）
+bind_port = 7000
+
+# 认证 token，客户端必须一致
+token = "your_secret_token"
+
+# ---- 传输层 ----
+# 是否允许客户端使用 yamux 多路复用（对应 frp 的 transport.tcpMux）
+# 开启后服务端会自动探测：yamux 客户端和非 yamux 客户端都能正常连接
+tcp_mux = true
+
+# 是否强制客户端必须使用 TLS（对应 frp 的 transport.tls.force）
+# false 时服务端依然接受 TLS 连接，靠首字节 0x17 / 0x16 自动识别
+tls_force = false
+
+# 传输协议：tcp（默认）或 quic
+#   quic 会在**同一个端口号**上额外监听 UDP，同时保留 TCP 监听 ——
+#   所以切换协议不会一刀切，老客户端照旧能连。
+#   QUIC 自带 TLS1.3 与流多路复用，1-RTT 握手、丢包不阻塞其它流；
+#   代价是防火墙 / 安全组要放行 UDP。客户端需配成一致的 quic。
+#   注意：官方 frp 的 transport.protocol 语义不同，与官方互通时保持 tcp。
+transport_protocol = "tcp"
+
+# QUIC 的**独立**监听端口（对应官方 frps 的 quicBindPort，v0.6.5 新增）
+#   配了就开一个独立的 UDP 端口，与 bindPort 无关：
+#     * 能把 QUIC 放到别的端口（bindPort 已被占用、或要做端口分流）
+#     * 与 TCP / KCP 解耦，防火墙规则更好写
+#   不配时：只有 transport_protocol = "quic" 才会在 bindPort 的同名 UDP 端口监听。
+#   配了之后**不再**顺带占用 bindPort/udp —— 避免"我配了 7101，为什么 7000/udp
+#   也被占"这种困惑。
+# quicBindPort = 7101
+
+# KCP 的独立监听端口（对应官方 frps 的 kcpBindPort）
+#   KCP 是裸 UDP 上的可靠传输，没有 QUIC 的握手分流能力，只能另开端口靠源地址区分。
+#   配了之后客户端把 transport.protocol 设成 kcp 并连这个端口即可。
+# kcpBindPort = 7001
+
+# UDP 转发的单报文缓冲上限（对应官方 udpPacketSize）
+#   ★ 官方默认 1500，本工具默认 **65507**（UDP over IPv4 的最大载荷）。
+#   为什么故意不同：它决定"单个 UDP 报文最多能带多少字节"，超过就被截断。
+#   改成 1500 会**静默截断**大报文（收得到包、内容少一截），比报错难查；
+#   想把行为对齐官方的部署，显式配 1500 即可。
+#   取值会被夹在 [1, 65507]。
+# udpPacketSize = 1500
+
+# ---- HTTP / HTTPS 虚拟主机 ----
+# 客户端用 http / https 类型代理时，按域名路由到对应内网服务。
+# 不配置这两项则 http / https 代理会被拒绝。
+vhost_http_port = 8080
+vhost_https_port = 8443
+# 泛域名后缀（对应 frp 的 subdomainHost）：客户端可只写 subdomain = "abc"
+# subdomain_host = "example.com"
+
+# ---- tcpmux（HTTP CONNECT 复用，v0.5.1 新增）----
+# 若干条 tcpmux 代理**共用这一个端口**，靠 CONNECT 请求行里的 authority 分发，
+# 支持 routeByHTTPUser 二级路由与 httpUser 鉴权。不配就不启用 tcpmux 代理。
+# 客户端侧对应 multiplexer = "httpconnect"。
+# tcpmux_http_connect_port = 7004
+# 把 CONNECT 原样转给内网（由内网自己回 200），而不是由 NFrp 先应答：
+# tcpmux_passthrough = false
+
+# ---- 虚拟主机行为（v0.5.1 新增）----
+# 等内网服务**响应头**的秒数（0 = 不限）。超时回 502（与 Go ReverseProxy 一致）。
+vhost_http_timeout = 60
+# 没有代理匹配时返回这个文件的原文（Content-Type: text/html）：
+# custom_404_page = "/etc/nfrp/404.html"
+
+# ---- 回给客户端的错误要不要带细节（v0.5.1 新增）----
+# false 时只回 `new proxy [xxx] error` / `invalid ping`，不会把"这个域名已被
+# 别的代理占用"这类**别人的隧道名**泄露出去。默认 true（与官方一致）。
+# detailed_errors_to_client = true
+
+# ---- xtcp 真 P2P（UDP 打洞 + QUIC 直连）----
+# 牵线用的 UDP 端口。配置后 xtcp 才会尝试打洞，打通了两端数据不再经过本机；
+# 不配置时 xtcp 退化为中继（与 stcp 相同），并会明确拒绝打洞请求，
+# 让访客快速失败而不是干等超时。
+# 注意：防火墙 / 云安全组要放行这个 UDP 端口。
+# p2p_port = 7002
+
+# ---- 内置面板与 Prometheus 指标 ----
+#   GET /             面板（在线客户端 / 代理 / 访客 / 占用端口 / 实时指标）
+#   GET /metrics      Prometheus exposition format（★ 需 enablePrometheus = true）
+#   GET /api/status   JSON 快照
+#   GET /api/healthz  存活探针（始终免鉴权，供 k8s / 负载均衡器用）
+#
+# ★ v0.6.5：`/metrics` **默认关闭**，与官方 frps 的 `enablePrometheus` 一致。
+#   要采集就显式打开：
+#     enablePrometheus = true
+#   为什么默认关：指标里含业务信息（在线客户端数、代理名、流量字节），
+#   "只想开个面板"的部署不该默认多暴露一份数据面。
+#   `/api/healthz` **不受**这个开关影响 —— 健康探针永远可用。
+#
+# 配了 dashboard_user 之后，除 healthz 外的端点需要 HTTP Basic Auth。
+# ★ 没配 dashboard_user 时面板**不鉴权** —— 此时若 bind_addr 不是回环地址，
+#   服务端会**拒绝启动**（匿名者能读面板、踢掉任意客户端、并对 nfrp 客户端
+#   直接开公网端口）。三条出路：配用户名密码 / 把 bind_addr 改成 127.0.0.1 /
+#   显式写 allow_insecure_dashboard = true 表明知情。
+#
+# 面板还能**写**（同样需要 Basic Auth，未鉴权返回 401）：
+#   POST /api/proxies/add     给某个客户端动态加一条代理（JSON: run_id + proxy）
+#   POST /api/proxies/remove  移除某条代理（JSON: run_id + name），端口随即收回
+#   POST /api/clients/kick    断开某个客户端（JSON: run_id）
+# 动态管理依赖对端也是 nfrp frpc（能力协商，官方 frpc 连上来会被标为不可管理）。
+# dashboard_port = 7500
+# dashboard_user = "admin"
+# dashboard_pwd = "change_me"
+# 面板不鉴权且对外监听 —— 默认 false，那种配置会被启动校验拦下。确实需要才打开。
+# allow_insecure_dashboard = true
+#
+# API v2（v0.3.4 新增；v1 的路径与响应**一个字节都没改**）：
+#   GET  /api/v2/version        API 版本与本进程支持的线协议
+#   GET  /api/v2/status         概览（指标 / 计数 / 上限 / 特性开关）
+#   GET  /api/v2/clients        客户端列表，分页 ?page=1&page_size=20
+#   GET  /api/v2/proxies        代理列表，分页，可加 ?user= ?client= ?q=
+#   GET  /api/v2/visitors       访客（stcp/xtcp 接入）列表
+#   GET  /api/v2/ports          已占端口及其背后的客户端
+#   GET  /api/v2/audit          审计日志查询，可加 ?kind= ?user= ?ok=
+#   POST /api/v2/proxies/add    同 v1 的三条写接口，但错误码统一
+#   POST /api/v2/proxies/remove
+#   POST /api/v2/clients/kick
+#   成功： {"api":"v2","data":…,"pagination":{"page":1,"page_size":20,"total":…}}
+#   失败： {"api":"v2","error":{"code":"not_found","message":"…"}}
+#   错误码是**稳定契约**（bad_request / not_found / method_not_allowed /
+#   admin_failed / internal），文案可以随便改，脚本请按 code 分支。
+#   单页上限 500；非法分页参数直接 400，不会悄悄退回第一页。
+
+# ---- 配置热重载 ----
+# 需配合 -c 指定配置文件（服务端会监视它的 mtime）。
+# log_level 与面板密码是**热生效**的；其余字段变更会记一条 WARN 提示需重启。
+hot_reload = false
+
+# ---- 资源上限（0 或不填 = 不限）----
+# 超限时拒绝并计入指标（clients_rejected / conns_rejected / proxy_failures），
+# 不会静默丢弃。配额是 RAII 的：令牌随连接 / 代理存活，注销即归还。
+# max_clients = 100            # 同时在线的客户端数
+# max_proxies_per_client = 50  # 单个客户端可注册的代理数
+# max_conns_per_client = 200   # 单个客户端同时转发的连接数
+# max_total_conns = 5000       # 全局同时转发的连接数
+# max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
+
+# ---- 端口管控（安全相关，对外提供服务时强烈建议配；v0.5.1 新增）----
+# ★ 不配 allow_ports 的话，**任何**拿到 token 的客户端都能申请 22 / 3306 这类端口
+#   并直接暴露到公网。写法与官方 frps.toml 一致，也接受字符串形式。
+# 只约束 tcp / udp（真正占公网端口的类型）：
+# allow_ports = [
+#   { start = 20000, end = 30000 },
+#   # { single = 8443 },
+# ]
+# 单个客户端最多占几个公网端口（0 = 不限）。注意它与 max_proxies_per_client
+# 不是一回事：http / https / tcpmux / stcp 这些不占公网端口的只算代理数。
+# max_ports_per_client = 20
+
+# ---- group 负载均衡策略（v0.6.3 新增，NFrp 扩展项）----
+# 同 group 的多个代理共享一个公网端口，用户连接在它们之间分摊。
+#
+#   roundrobin（默认）  严格 1/N 轮询。**与官方 frp 的行为一致**
+#                       —— 官方 server/group/*.go 用 channel fan-out 实现，
+#                       哪个代理先 Accept 谁拿到，效果就是无状态轮询。
+#   leastconn           优先给"在途连接最少"的后端。多后端处理能力不均时
+#                       会自动向快的倾斜。
+#
+# 默认选 roundrobin 是刻意的：把"谁不健康"交给健康检查去处理（不健康就
+# 摘掉后端），调度器只做无状态均分 —— 运维上更容易理解和预测。
+#
+# 这是本项目的超集能力：调度完全发生在服务端内部，开它不影响与官方
+# 客户端 / 服务端的互通。
+# lb_policy = "leastconn"
+
+# ---- KCP 会话表上限（v0.6.3 新增，NFrp 扩展项）----
+# KCP 是"每个 UDP 源端口一个会话"的模型，每会话约占 15.3 KB。
+# 这个值直接决定内存上界：值 × 15.3 KB。
+#
+#   1024（默认）  ≈ 15 MB     绝大多数部署
+#   4096          ≈ 62 MB     数千客户端的单实例
+#   16384         ≈ 250 MB    需确认内存充足
+#
+# ★ 超大规模部署的正确做法**不是无限调大**，而是：
+#   1. 用 TCP / QUIC 承载控制连接（KCP 只在后者都走不通时才需要）；
+#   2. 或在前面挂负载均衡，把客户端拆到多个 frps 实例上。
+#
+# 低于 64 会被自动抬到安全下限（配成 0 等于关掉 KCP，那属于静默失效）。
+# 0 或不填 = 用默认值 1024。
+# kcp_max_sessions = 4096
+
+# 心跳超时（秒），超时未收到客户端消息则断开
+heartbeat_timeout = 90
+
+# ============================================================
+# v0.3.4 新增：认证 / 权限 / 审计 / 虚拟网络
+#
+# 下面每一段**不写就是关的** —— 老配置文件一个字节都不用改，
+# 行为与升级前完全一致。想开哪项再取消对应的注释。
+# ============================================================
+
+# ---- 认证方式（[auth]）----
+# 不写 [auth] 时用上面的顶层 token（与老版本一致）。
+# method 只认 "token"（默认）和 "oidc"。
+#
+#   [auth]
+#   method = "oidc"
+#   [auth.oidc]
+#   issuer = "https://keycloak.example.com/realms/myrealm"
+#   audience = "nfrp"
+#   # 只在对接自签 / 内网 IdP 时才需要下面几项：
+#   # skipExpiryCheck = false     # 调试用：跳过 token 过期检查（生产别开）
+#   # skipIssuerCheck = false
+#   # trustedCaFile = "/etc/ssl/private-ca.pem"
+#   # insecureSkipVerify = false
+#   # proxyURL = "http://10.0.0.1:3128"
+#
+# 注意 OIDC 模式下的两处语义差别（写在这里免得调试时踩）：
+#   * 客户端的凭证是 IdP 签发的 **access token 原样**，不做 md5 派生；
+#   * 控制通道的加密密钥也改用 access token（两端同源），
+#     否则会出现"能登录、但之后每条消息都解不开"。
+
+# 令牌来自外部源（对应官方 frps 的 auth.tokenSource，v0.6.5 新增）
+#   token 不必写在配置里，适合 k8s Secret / Vault sidecar 这类把密钥挂成文件的部署。
+#   与 token 互斥：两者都配时**以 tokenSource 为准**并告警。
+#
+#   支持两种 type：
+#     file —— 读文件内容，自动去掉首尾空白（文件末尾的换行不会破坏比对）
+#     exec —— 跑一个子进程，取它的 stdout
+#
+#   [auth.tokenSource]
+#   type = "file"
+#   [auth.tokenSource.file]
+#   path = "/etc/nfrp/token"
+#
+#   [auth.tokenSource]
+#   type = "exec"
+#   [auth.tokenSource.exec]
+#   command = "/usr/local/bin/get-nfrp-token"
+#   args = ["--format", "raw"]
+#   [[auth.tokenSource.exec.env]]
+#   name = "VAULT_ADDR"
+#   value = "https://vault.example.com:8200"
+#
+# ★ 安全提醒：exec 类型会**以本进程身份执行外部程序** ——
+#   能改这份配置的人等于能执行任意命令。只需要读文件时请用 type = "file"。
+#   两种方式在启动日志里都会明确打出令牌来源，便于审计。
+
+# ---- IP 白 / 黑名单（[acl]）----
+# 在**认证之前**执行，所以被拒的连接连 token 都不用发。
+# deny 优先于 allow；两边都不写 = 不限制。
+# 支持单个 IP 与 CIDR，IPv4 / IPv6 都可以。
+#
+#   [acl]
+#   allow = ["10.0.0.0/8", "192.168.0.0/16", "2001:db8::/32"]
+#   deny = ["10.1.2.3"]
+
+# ---- 角色与权限（[[roles]]）----
+# 按**顺序**匹配，先命中先用 —— 所以把最具体的角色写在前面。
+# 没有任何角色匹配时，看 defaultRole / denyUnknown：
+#   defaultRole = "guest"  → 套用这个角色
+#   denyUnknown = true     → 直接拒绝登录
+#
+#   [[roles]]
+#   name = "ops"
+#   users = ["alice", "bob"]            # 匹配客户端 Login 里声明的 user
+#   allowProxyTypes = ["tcp", "http"]   # 留空 = 不限类型
+#   portRange = "7000-7999"             # 留空 = 不限端口
+#   allowManage = true                  # 是否允许面板动态增删它的代理
+#   allowVisitors = true                # 是否允许开 stcp / xtcp 访客
+#   maxProxies = 20                     # 0 = 不限
+#
+# defaultRole = ""
+# denyUnknown = false
+
+# ---- 审计日志（[audit]）----
+# 默认**关**：不落文件、不占内存，开启时的开销也只有"一次追加写"。
+# 记录登录（成功与失败都会记）、建代理、断代理、踢人等事件。
+#
+#   [audit]
+#   enable = true
+#   path = "/var/log/nfrp/audit.jsonl"   # 留空 = 只留内存，重启即失
+#   maxEntries = 1000                          # 面板查询用的内存条数
+
+# ---- VirtualNet 虚拟网络 ----
+# 给客户端分配虚拟内网地址，让它们在**三层**上互通（而不只是端口转发）。
+#
+# 单独占一个端口，刻意不与控制端口复用：虚拟网络是长时间高速的纯数据流，
+# 混进控制通道会拖慢心跳与面板命令，出故障时也不好隔离。
+#
+#   vnet_port = 7003
+#   [vnet]
+#   network = "100.64.0.0"        # 地址池起点
+#   subnet = "100.64.0.0/24"
+#   mtu = 1400                    # 隧道有额外开销，取小了比被分片强
+#
+# 客户端侧要写 [virtualNet] 并填 serverPort = 7003。
+# 虚拟网卡（TUN）目前只在 Linux 上实现；Windows 上客户端会明确报错而不是静默不生效。
+
+# 日志级别：error / warn / info / debug / trace
+log_level = "info"
+
+# ---- 日志落盘（v0.5.1 新增）----
+# log_level 也可以写在下面这个 [log] 段里（与官方 frps.toml 一致）。
+# 不配 to 时写标准输出；配了就写文件，按天轮转、按 maxDays 清理老备份。
+# [log]
+# to = "/var/log/nfrps.log"
+# maxDays = 3                 # 备份日志保留天数（<=0 = 不清理）
+# level = "info"

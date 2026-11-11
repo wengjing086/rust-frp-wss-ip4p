@@ -1,0 +1,1605 @@
+//! 客户端本地管理界面（`[webServer]`）。
+//!
+//! # 与官方 frpc 的关系
+//!
+//! 官方 frpc 也有 `[webServer]`，但它**只能看和重载配置** —— 想加一条隧道
+//! 仍然得回去改配置文件。这里多做了一步：可以直接增删代理，而且走的是和
+//! "服务端面板下发的 `ServerCmd`"**同一条链路**（注册 `NewProxy` / 撤销
+//! `CloseProxy`），所以两个入口的行为完全一致，不会出现"面板加得了、
+//! 本地界面加不了"这种分裂。
+//!
+//! # 为什么写操作要排队
+//!
+//! 控制连接（[`FrpConn`]）是被会话主循环**独占**的：收发都在那一个 `select!`
+//! 里。所以 Web 侧不能直接 `conn.send_msg(...)`，只能把请求塞进一条通道，
+//! 由主循环取出来执行（见 [`handle_request`]）。
+//!
+//! 这不只是为了"避免数据竞争"，还为了**等 `NewProxyResp` 期间能顺手处理
+//! `ReqWorkConn`**：服务端一边回注册结果、一边在要工作连接，如果这里只顾着
+//! 等回应、不去建连接，服务端就会认为本端掉线，把刚注册的代理收回去。
+//!
+//! # 默认关闭
+//!
+//! `[webServer] port` 不写就是 0 —— 那时候整个模块**一行都不会执行**：
+//! 没有监听端口，没有后台任务，与上一个版本完全一致。
+
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use nfrp_common::{
+    config::{ClientConfig, ProxyConfig},
+    frp::{
+        conn::FrpConn,
+        msg::{CloseProxy, FrpMessage, NewProxy},
+    },
+    http1, util,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+};
+use tokio_rustls::TlsAcceptor;
+use tracing::{debug, info, warn};
+
+use crate::{health, registry::ProxyTable, store::Store, ClientSession, ServerLink};
+
+/// 等 `NewProxyResp` 的最长时间。
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Web 侧等主循环完成一次写操作的最长时间。
+///
+/// 比 [`REGISTER_TIMEOUT`] 长一点：多出来的时间是留给"请求在主循环里排队"的
+/// —— 比如主循环此刻正在处理服务端下发的 `ServerCmd`。
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 健康检查路径（免鉴权）。
+pub const HEALTHZ_PATH: &str = "/api/healthz";
+
+/// 一次写操作的回执。
+pub type Reply = oneshot::Sender<Result<String, String>>;
+
+/// 交给会话主循环执行的写操作。
+pub enum Request {
+    /// 新增代理并注册到服务端。
+    AddProxy {
+        proxy: Box<ProxyConfig>,
+        reply: Reply,
+    },
+    /// 移除代理并通知服务端。
+    RemoveProxy { name: String, reply: Reply },
+}
+
+/// 会话守卫：会话一结束就把请求通道摘掉。
+///
+/// 用 `Drop` 而不是在函数末尾手写一句 `detach` —— 会话里有好几处提前
+/// `?` 返回，手写的话迟早漏掉一条，而漏掉的后果是"重连期间界面上的操作
+/// 全部卡 20 秒然后超时"，很难联想到是这个原因。
+pub struct SessionGuard(Arc<Hub>);
+
+impl SessionGuard {
+    pub fn new(hub: Arc<Hub>, tx: mpsc::UnboundedSender<Request>) -> Self {
+        hub.attach_session(tx);
+        Self(hub)
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.0.detach_session();
+    }
+}
+
+/// Web 界面的共享状态。
+pub struct Hub {
+    cfg: Arc<ClientConfig>,
+    proxies: ProxyTable,
+    store: Arc<Store>,
+    health: Arc<health::Monitor>,
+    /// 当前会话（重连期间为 None）。
+    session: tokio::sync::watch::Receiver<Option<Arc<ClientSession>>>,
+    /// 与**当前**会话之间的写请求通道。会话重建时会被换掉。
+    req_tx: Mutex<Option<mpsc::UnboundedSender<Request>>>,
+    /// `stop` 的触发点：`POST /api/stop` 置 true，主循环据此退出。
+    ///
+    /// 用 `watch` 而不是 `Notify`：watch 的**值会留存**，所以 stop 请求即使在
+    /// 主循环还没进 `select!` 时到达也不会丢（`Notify` 只在恰好有 waiter 时生效）。
+    stop: tokio::sync::watch::Sender<bool>,
+    /// 最近一次会话的失败原因（连不上 / 被拒绝 / 注册超时……）。
+    ///
+    /// ★ v0.7.6：自启动场景（`frpc.vbs` 隐藏窗口）下没有控制台，进程又按
+    /// 退避策略**不再退出**，于是失败会完全静默 —— 用户只看到面板里的空列表。
+    /// 这里把最后一次错误留在内存里，由 `/api/status` 与页面直接展示。
+    last_error: Mutex<String>,
+    /// 每条代理在**当前/最近一次**会话里的注册结果（键是配置里的原始 `name`）。
+    reg_states: Mutex<HashMap<String, RegState>>,
+}
+
+/// 单条代理的注册结果。
+#[derive(Clone, Default)]
+pub struct RegState {
+    pub registered: bool,
+    /// 服务端回的错误（注册失败时非空）。
+    pub error: String,
+}
+
+impl Hub {
+    pub fn new(
+        cfg: Arc<ClientConfig>,
+        proxies: ProxyTable,
+        store: Arc<Store>,
+        health: Arc<health::Monitor>,
+        session: tokio::sync::watch::Receiver<Option<Arc<ClientSession>>>,
+    ) -> Arc<Self> {
+        let (stop, _) = tokio::sync::watch::channel(false);
+        Arc::new(Self {
+            cfg,
+            proxies,
+            store,
+            health,
+            session,
+            req_tx: Mutex::new(None),
+            stop,
+            last_error: Mutex::new(String::new()),
+            reg_states: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// `stop` 的信号接收端（`[webServer]` 启用时由主循环监听）。
+    pub fn stop_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
+    /// 请求客户端退出 —— `POST /api/stop` 的落点，对应原版 `frpc stop`。
+    fn request_stop(&self) {
+        let _ = self.stop.send(true);
+    }
+
+    /// 会话建好时调用：清掉上一轮的失败原因与注册结果。
+    pub fn on_session_started(&self) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = String::new();
+        self.reg_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// 记录一次会话失败，供面板展示。
+    pub fn note_session_error(&self, err: impl Into<String>) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = err.into();
+    }
+
+    /// 记录一条代理注册成功（`name` 用配置里的原始名字）。
+    pub fn note_proxy_ok(&self, name: &str) {
+        self.reg_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                name.to_string(),
+                RegState {
+                    registered: true,
+                    error: String::new(),
+                },
+            );
+    }
+
+    /// 记录一条代理注册失败（`name` 用配置里的原始名字）。
+    pub fn note_proxy_err(&self, name: &str, error: impl Into<String>) {
+        self.reg_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                name.to_string(),
+                RegState {
+                    registered: false,
+                    error: error.into(),
+                },
+            );
+    }
+
+    /// 会话建立时挂上请求通道。
+    pub fn attach_session(&self, tx: mpsc::UnboundedSender<Request>) {
+        *self.req_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    /// 会话结束时摘掉。
+    ///
+    /// 不摘的话，重连窗口期的请求会被投进一个**没有人读**的通道，
+    /// 用户看到的是"卡 20 秒然后超时"，而不是立刻被告知"客户端没连上"。
+    pub fn detach_session(&self) {
+        *self.req_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    async fn ask<F>(&self, make: F) -> Result<String, String>
+    where
+        F: FnOnce(Reply) -> Request,
+    {
+        let (tx, rx) = oneshot::channel();
+        let req = make(tx);
+        let sender = self
+            .req_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(sender) = sender else {
+            return Err("客户端当前没有连上服务端（正在重连？），稍后再试".to_string());
+        };
+        if sender.send(req).is_err() {
+            return Err("客户端会话已结束，请稍后再试".to_string());
+        }
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err("会话在处理这条请求前断开了".to_string()),
+            Err(_) => Err(format!("{} 秒内没有完成", REQUEST_TIMEOUT.as_secs())),
+        }
+    }
+
+    async fn add(&self, body: &str) -> Result<String, String> {
+        if body.trim().is_empty() {
+            return Err("请求体不能为空（要一个 JSON 的代理配置）".to_string());
+        }
+        let p: ProxyConfig =
+            serde_json::from_str(body).map_err(|e| format!("代理配置解析失败：{e}"))?;
+        if p.name.trim().is_empty() {
+            return Err("缺少 name".to_string());
+        }
+        if p.proxy_type.trim().is_empty() {
+            return Err("缺少 type".to_string());
+        }
+        // 类型 / 插件 / tcpmux 三道校验：配置文件路径本来就有，这条 API 路径
+        // 原先一道都不过（`tls2raw` 之类未实现的插件能从这里溜进去，
+        // 一路要到运行期才逐条连接失败）。
+        //
+        // `is_remote = false`：调用方是**本机用户**（面板就长在本机上），
+        // 他本来就有权指定 `pluginLocalPath` 这些本机资源字段。
+        nfrp_common::config::validate_remote_proxy(&p, false)
+            .map_err(|e| format!("代理配置未通过校验：{e}"))?;
+        if self.proxies.get(&p.name).is_some() {
+            return Err(format!("已存在同名代理 [{}]", p.name));
+        }
+        self.ask(|reply| Request::AddProxy {
+            proxy: Box::new(p),
+            reply,
+        })
+        .await
+    }
+
+    async fn remove(&self, body: &str) -> Result<String, String> {
+        let name = proxy_name_of(body)?;
+        if self.proxies.get(&name).is_none() {
+            return Err(format!("本地没有代理 [{name}]"));
+        }
+        self.ask(|reply| Request::RemoveProxy { name, reply }).await
+    }
+}
+
+/// 从请求体里取代理名。
+///
+/// 两种写法都收：`{"name":"web"}` 和裸的 `web`
+/// —— `curl -d web` 比 `curl -d '{"name":"web"}'` 好敲得多。
+fn proxy_name_of(body: &str) -> Result<String, String> {
+    let t = body.trim();
+    if t.is_empty() {
+        return Err("请求体不能为空（代理名或 {\"name\":\"...\"}）".to_string());
+    }
+    if !t.starts_with('{') {
+        return Ok(t.to_string());
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(t).map_err(|e| format!("请求体不是合法 JSON：{e}"))?;
+    let n = v
+        .get("name")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if n.is_empty() {
+        return Err("缺少 name".to_string());
+    }
+    Ok(n)
+}
+
+/// 启动本地管理界面。
+///
+/// 调用方负责在 `[webServer] port != 0` 时才调用它 —— 函数本身不做判断，
+/// 免得"要不要监听"这件事有两个地方各判一次。
+pub async fn run(listener: TcpListener, hub: Arc<Hub>) {
+    run_with_tls(listener, hub, None).await
+}
+
+/// [`run`] 的 TLS 版本。`tls = Some(..)` 时只接受 HTTPS。
+pub async fn run_with_tls(listener: TcpListener, hub: Arc<Hub>, tls: Option<TlsAcceptor>) {
+    let addr = listener.local_addr().ok();
+    let secure = tls.is_some();
+    info!(
+        "客户端管理界面已启动：{}://{}/  （/api/status 状态、/api/proxies 代理表）",
+        if secure { "https" } else { "http" },
+        addr.map(|a| a.to_string()).unwrap_or_default()
+    );
+    let user = hub.cfg.web_server.user.trim();
+    if user.is_empty() {
+        // 真正的拒绝发生在 `main.rs` 里 **bind 之前** —— 只有那里 bail 才是
+        // "拒绝启动"。这里只记一条日志，否则会出现"日志说拒绝了、端口却开着"
+        // 这种比不检查更误导的状态。
+        if nfrp_common::util::is_loopback_addr(&hub.cfg.web_server.addr) {
+            debug!("管理界面只监听回环地址，未配置凭据（本机可用）");
+        } else {
+            warn!(
+                addr = %hub.cfg.web_server.addr,
+                "管理界面监听在非回环地址上却没有配置 user/password —— \
+                 任何能访问这个端口的人都能增删你的隧道。"
+            );
+        }
+    } else {
+        info!("管理界面已启用 Basic Auth（用户 {user}）");
+    }
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                let hub = hub.clone();
+                let tls = tls.clone();
+                tokio::spawn(async move {
+                    let result = match tls {
+                        Some(acceptor) => match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => handle(s, peer, hub, true).await,
+                            Ok(Err(e)) => Err(anyhow::anyhow!("客户端管理界面 TLS 握手失败：{e}")),
+                            Err(_) => Err(anyhow::anyhow!("客户端管理界面 TLS 握手超时")),
+                        },
+                        None => handle(stream, peer, hub, false).await,
+                    };
+                    if let Err(e) = result {
+                        debug!(%peer, "客户端管理界面连接结束：{e:#}");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!("客户端管理界面 accept 失败：{e}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+}
+
+/// 回环判定统一走 `common::util` —— 原先这里有第二份实现，口径还不一样
+/// （本地版认 `localhost`，common 版不认）。两份实现迟早漂移，删掉这份。
+#[cfg(test)]
+use nfrp_common::util::is_loopback_addr;
+
+/// 一次管理界面请求的处理结果（不涉及 socket）。
+///
+/// ★ v0.5.10（照官方 frp 的做法重构）：把 `handle` 里**与 socket 无关**的
+/// 判定逻辑抽出来，让测试可以直接调它 —— 与官方
+/// `frp-0.71.0/server/http/controller_v2_test.go` 里的
+/// `resp := httptest.NewRecorder(); handler.ServeHTTP(resp, req)` 同构。
+///
+/// # 为什么必须这么改
+///
+/// 原测试辅助函数 `handle_over_socket` 开真 socket、`tokio::spawn` 服务端、
+/// 客户端再连过去 —— **自己造了一个竞态**。云端 Linux 上实测：
+/// 时间线插桩显示 `accept()` 有时**永不返回**（`TL S2 accept 返回` 缺失），
+/// 于是 4 个用它写的测试必然失败（每个卡满 5 秒）。
+///
+/// 而产品本身没有这个问题：真实部署里 frpc 与"客户端"是**两个进程**，
+/// 双进程实测 `ok=100 fails=0`。
+///
+/// ⇒ 测试不该为了"真实"而付出引入竞态的代价。官方 frp 就不这么做。
+pub(crate) struct Decision {
+    pub code: u16,
+    pub ctype: &'static str,
+    /// 用字节而不是 `String`：pprof 输出是 protobuf，不保证是合法 UTF-8。
+    pub body: Vec<u8>,
+}
+
+impl Decision {
+    fn text(code: u16, ctype: &'static str, body: impl Into<String>) -> Self {
+        Self {
+            code,
+            ctype,
+            body: body.into().into_bytes(),
+        }
+    }
+}
+
+/// 纯逻辑：给定一条已解析的请求，算出该回什么。**不碰 socket。**
+///
+/// 判定顺序与 `handle` 原先**逐字一致**（这只是搬家，不是改语义）：
+/// 1. `/api/healthz` 免鉴权（容器探针不方便带凭据，且只回 `ok`）
+/// 2. Basic Auth 失败 → 401
+/// 3. 写操作：任何一条 `Origin` 非本机 → 403
+/// 4. 写操作：缺 `X-Nfrp-Client` 头 → 403
+/// 5. 其余交给 [`route`]
+async fn decide(hub: &Arc<Hub>, req: &http1::Request, peer: SocketAddr) -> Decision {
+    let path = req.path.as_str();
+    let method = req.method.as_str();
+
+    // 健康探针排在鉴权**之前**：容器探针不方便带凭据，
+    // 而它只回一个 "ok"，泄露的信息量为零。
+    if path == HEALTHZ_PATH {
+        if method != "GET" && method != "HEAD" {
+            return Decision::text(405, CT_JSON, err_body("method_not_allowed", "只支持 GET"));
+        }
+        return Decision::text(200, "text/plain; charset=utf-8", "ok\n");
+    }
+
+    if let Some(body) = auth_failure(hub, req) {
+        return Decision::text(401, CT_JSON, body);
+    }
+
+    // pprof 必须在鉴权之后；输出是二进制，不能走下面的 `route -> String`。
+    if method == "GET" || method == "HEAD" {
+        if let Some(d) = pprof_decision(hub, req).await {
+            return d;
+        }
+    }
+
+    // ---- CSRF / DNS rebinding 防线 ----
+    //
+    // 这个界面原先**只看 Basic Auth**，而 `user` 留空时连鉴权都跳过。
+    // 于是恶意网页可以：① 盲打 `POST /api/proxies/add` 增删隧道；
+    // ② 盲打 `POST /api/stop` 直接把客户端关掉；③ 用 DNS rebinding
+    // 把自己伪装成 `http://evil.com` 再访问 127.0.0.1 上的这个端口。
+    //
+    // 两道检查，都只对**写操作**生效（读接口不产生副作用）：
+    //
+    // 1. **来源校验**：带了 `Origin` 就必须是本机回环来源。浏览器发的
+    //    跨站请求一定会带 `Origin`（fetch/XHR/表单都带），而 curl / 脚本
+    //    这类合法调用方默认不带 —— 所以"没有 Origin 就放行"是安全的，
+    //    且不会误伤命令行用法。
+    // 2. **自定义头**：要求写操作带 `X-Nfrp-Client: 1`。自定义头会触发
+    //    浏览器的 CORS 预检，而本界面**不回应任何预检**，于是跨站
+    //    写请求根本发不出来。命令行调用方带一下这个头即可。
+    if is_write_method(method) {
+        // ★ v0.5.4 修（L7）：检查**所有** `Origin` 头，而不是只看第一个。
+        //
+        // 原先用 `req.header("origin")` —— 它只返回第一个同名头的值。
+        // 攻击者发两个 `Origin`（一个本机、一个跨站）时，若某个中间层/浏览器
+        // 取的是**后一个**，就会出现"我们放行了、对方认为是跨站"的认知差。
+        // 逐跳校验任何一条不本机就拒绝，代价为零。
+        for origin in req.headers_all("origin") {
+            if !origin_is_local(&origin) {
+                debug!(%peer, origin, "拒绝跨站写请求");
+                return Decision::text(
+                    403,
+                    CT_JSON,
+                    err_body("forbidden", "写操作不允许跨站来源（Origin 不是本机）"),
+                );
+            }
+        }
+        if req.header(CSRF_HEADER).is_none() {
+            debug!(%peer, %method, %path, "拒绝缺少防伪头的写请求");
+            return Decision::text(
+                403,
+                CT_JSON,
+                err_body(
+                    "forbidden",
+                    &format!("写操作必须带 {CSRF_HEADER} 头（防止网页盲打本地接口）"),
+                ),
+            );
+        }
+    }
+
+    let (code, ctype, body) = route(hub, method, path, req).await;
+    Decision::text(code, ctype, body)
+}
+
+/// `webServer.pprofEnable`：客户端管理界面上的 CPU profile。
+///
+/// 返回 `None` 表示这不是 pprof 路径，继续走普通路由。
+async fn pprof_decision(hub: &Arc<Hub>, req: &http1::Request) -> Option<Decision> {
+    let path = req.path.as_str();
+    if path != "/debug/pprof" && path != "/debug/pprof/" && path != "/debug/pprof/profile" {
+        return None;
+    }
+    if !hub.cfg.web_server.pprof_enable {
+        return Some(Decision::text(
+            404,
+            "text/plain; charset=utf-8",
+            "pprof disabled: set webServer.pprofEnable = true\n",
+        ));
+    }
+    if path != "/debug/pprof/profile" {
+        return Some(Decision::text(
+            200,
+            "text/plain; charset=utf-8",
+            "GET /debug/pprof/profile?seconds=N\n",
+        ));
+    }
+
+    let secs = nfrp_common::pprof_http::parse_seconds(&req.query);
+    match tokio::task::spawn_blocking(move || nfrp_common::pprof_http::capture_cpu_profile(secs))
+        .await
+    {
+        Ok(Ok(body)) => Some(Decision {
+            code: 200,
+            ctype: "application/octet-stream",
+            body,
+        }),
+        Ok(Err(e)) => {
+            let text = format!("pprof failed: {e:#}\n");
+            let code = if text.contains("only supported on Unix") {
+                501
+            } else {
+                500
+            };
+            Some(Decision::text(code, "text/plain; charset=utf-8", text))
+        }
+        Err(e) => Some(Decision::text(
+            500,
+            "text/plain; charset=utf-8",
+            format!("pprof task failed: {e}\n"),
+        )),
+    }
+}
+
+async fn handle<S>(mut stream: S, peer: SocketAddr, hub: Arc<Hub>, hsts: bool) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let req = http1::read_request(&mut stream).await?;
+    let d = decide(&hub, &req, peer).await;
+    let extra: &[(&str, &str)] = if hsts {
+        &[(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )]
+    } else {
+        &[]
+    };
+    http1::send(&mut stream, d.code, d.ctype, &d.body, extra).await?;
+    debug!(%peer, method = %req.method, path = %req.path, code = d.code, "客户端管理界面请求已处理");
+    Ok(())
+}
+
+/// 防 CSRF 用的自定义头名。
+///
+/// 名字里带 `X-` 且非标准 ⇒ 浏览器把它当**非简单请求**，跨站时会先发
+/// OPTIONS 预检；本界面不回应预检，所以跨站写请求到不了这里。
+pub const CSRF_HEADER: &str = "x-nfrp-client";
+
+/// 会产生副作用的 HTTP 方法。
+fn is_write_method(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+}
+
+/// `Origin` 是不是本机来源。
+///
+/// 只认 `http://127.x.x.x[:port]` / `http://localhost[:port]` / `http://[::1][:port]`。
+/// 判定从严：解析不出主机名就当作非本机。
+fn origin_is_local(origin: &str) -> bool {
+    let rest = match origin.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => rest,
+        // https 来源不可能是这个明文界面，直接拒
+        _ => return false,
+    };
+    // 去掉路径（Origin 规范上不含路径，但防御性地处理一下）
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    let host = if let Some(h) = host_port.strip_prefix('[') {
+        // IPv6：`[::1]:8080`
+        h.split(']').next().unwrap_or(h)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    host.eq_ignore_ascii_case("localhost") || nfrp_common::util::is_loopback_addr(host)
+}
+
+/// `Some(响应体)` 表示鉴权没过。
+fn auth_failure(hub: &Hub, req: &http1::Request) -> Option<String> {
+    let user = hub.cfg.web_server.user.trim();
+    if user.is_empty() {
+        return None;
+    }
+    let expected = format!("{}:{}", user, hub.cfg.web_server.password);
+    match http1::basic_auth(req.authorization().as_deref()) {
+        Some(g) if http1::constant_time_eq(&g, &expected) => None,
+        _ => Some(err_body("unauthorized", "需要 Basic Auth 凭证")),
+    }
+}
+
+const CT_JSON: &str = "application/json; charset=utf-8";
+const CT_HTML: &str = "text/html; charset=utf-8";
+
+async fn route(
+    hub: &Arc<Hub>,
+    method: &str,
+    path: &str,
+    req: &http1::Request,
+) -> (u16, &'static str, String) {
+    match (method, path) {
+        ("GET", "/") | ("GET", "/index.html") => (200, CT_HTML, html_page()),
+        ("GET", "/api/status") => (200, CT_JSON, status_json(hub)),
+        ("GET", "/api/proxies") => (200, CT_JSON, proxies_json(hub)),
+        ("POST", "/api/proxies/add") => match hub.add(&req.body).await {
+            Ok(m) => (200, CT_JSON, ok_body(&m)),
+            Err(e) => (400, CT_JSON, err_body("add_failed", &e)),
+        },
+        ("POST", "/api/proxies/remove") => match hub.remove(&req.body).await {
+            Ok(m) => (200, CT_JSON, ok_body(&m)),
+            Err(e) => (400, CT_JSON, err_body("remove_failed", &e)),
+        },
+        // 等价原版 `frpc stop`：官方也是打本地 admin API 让进程退出。
+        ("POST", "/api/stop") => {
+            hub.request_stop();
+            (200, CT_JSON, ok_body("客户端正在停止"))
+        }
+        _ => {
+            const KNOWN: &[&str] = &[
+                "/",
+                "/index.html",
+                "/api/status",
+                "/api/proxies",
+                "/api/proxies/add",
+                "/api/proxies/remove",
+                "/api/stop",
+                "/debug/pprof",
+                "/debug/pprof/",
+                "/debug/pprof/profile",
+            ];
+            if KNOWN.contains(&path) {
+                (
+                    405,
+                    CT_JSON,
+                    err_body("method_not_allowed", &format!("{path} 不支持 {method}")),
+                )
+            } else {
+                (
+                    404,
+                    CT_JSON,
+                    err_body("not_found", &format!("没有这个路径：{path}")),
+                )
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 会话侧：在主循环里执行写请求
+// ---------------------------------------------------------------------------
+
+/// 执行一条来自 Web 界面的写请求。
+///
+/// 由会话主循环调用 —— 它此刻**独占着控制连接**，所以能安全地发消息、
+/// 并在等回应的同时处理 `ReqWorkConn`。
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_request(
+    req: Request,
+    conn: &mut FrpConn,
+    link: &Arc<ServerLink>,
+    run_id: &Arc<String>,
+    proxies: &ProxyTable,
+    store: &Store,
+    health: &Arc<health::Monitor>,
+    cfg: &ClientConfig,
+) {
+    match req {
+        Request::AddProxy { proxy, reply } => {
+            let r = add_live(conn, link, run_id, proxies, store, health, cfg, *proxy).await;
+            let _ = reply.send(r);
+        }
+        Request::RemoveProxy { name, reply } => {
+            let r = remove_live(conn, proxies, store, cfg, &name).await;
+            let _ = reply.send(r);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn add_live(
+    conn: &mut FrpConn,
+    link: &Arc<ServerLink>,
+    run_id: &Arc<String>,
+    proxies: &ProxyTable,
+    store: &Store,
+    health: &Arc<health::Monitor>,
+    cfg: &ClientConfig,
+    p: ProxyConfig,
+) -> Result<String, String> {
+    if proxies.get(&p.name).is_some() {
+        return Err(format!("已存在同名代理 [{}]", p.name));
+    }
+    let wire = NewProxy::from_config(&p, &cfg.user);
+
+    // 本地表**先认下这条代理**。
+    //
+    // 顺序不能反：服务端随时可能为它发 `ReqWorkConn`，而工作连接要拿代理名
+    // 查本地表，查不到就只能打一句"未知代理"然后把连接断掉 —— 用户看到的是
+    // "添加成功但访问一直 503"。
+    proxies.insert(p.clone());
+
+    if let Err(e) = conn.send_msg(&FrpMessage::NewProxy(wire)).await {
+        proxies.remove(&p.name);
+        return Err(format!("向服务端发送 NewProxy 失败：{e:#}"));
+    }
+
+    let deadline = Instant::now() + REGISTER_TIMEOUT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            proxies.remove(&p.name);
+            return Err(format!(
+                "{} 秒内没等到服务端的回应（已撤回本地改动）",
+                REGISTER_TIMEOUT.as_secs()
+            ));
+        }
+        let msg = match tokio::time::timeout(left, conn.recv_msg()).await {
+            Err(_) => {
+                proxies.remove(&p.name);
+                return Err(format!(
+                    "{} 秒内没等到服务端的回应（已撤回本地改动）",
+                    REGISTER_TIMEOUT.as_secs()
+                ));
+            }
+            Ok(Err(e)) => {
+                proxies.remove(&p.name);
+                return Err(format!("控制连接出错：{e:#}"));
+            }
+            Ok(Ok(None)) => {
+                proxies.remove(&p.name);
+                return Err("服务端关闭了控制连接".to_string());
+            }
+            Ok(Ok(Some(m))) => m,
+        };
+
+        match msg {
+            FrpMessage::NewProxyResp(r) => {
+                if !r.error.is_empty() {
+                    proxies.remove(&p.name);
+                    return Err(format!("服务端拒绝：{}", r.error));
+                }
+                // 落盘：重启后它还认得回来（没配 `[store] path` 时是空操作）
+                if let Err(e) = store.put(&p) {
+                    warn!(proxy = %p.name, error = %e, "写入 store 失败：重启后这条代理会丢失");
+                }
+                info!(proxy = %p.name, remote = %r.remote_addr, "管理界面新增代理成功");
+                return Ok(format!("代理 [{}] 已生效：{}", p.name, r.remote_addr));
+            }
+            FrpMessage::ReqWorkConn => {
+                // **必须处理**：服务端正在等工作连接，这里不去建，
+                // 它就会认为本端掉线，把刚注册的代理收回去。
+                crate::spawn_work_conn(
+                    link.clone(),
+                    run_id.clone(),
+                    proxies.clone(),
+                    health.clone(),
+                    crate::nlink::current(),
+                );
+            }
+            FrpMessage::Pong(pong) => {
+                if !pong.error.is_empty() {
+                    warn!("服务端 Pong 返回错误：{}", pong.error);
+                }
+            }
+            other => debug!("等待 NewProxyResp 期间收到 {}，忽略", other.name()),
+        }
+    }
+}
+
+async fn remove_live(
+    conn: &mut FrpConn,
+    proxies: &ProxyTable,
+    store: &Store,
+    cfg: &ClientConfig,
+    name: &str,
+) -> Result<String, String> {
+    let Some(p) = proxies.remove(name) else {
+        return Err(format!("本地没有代理 [{name}]"));
+    };
+    // 通知服务端把端口 / 域名收回去。用的是**线上全名**（带 `{user}.` 前缀）。
+    let wire_name = util::add_user_prefix(&cfg.user, name);
+    if let Err(e) = conn
+        .send_msg(&FrpMessage::CloseProxy(CloseProxy {
+            proxy_name: wire_name,
+        }))
+        .await
+    {
+        // 本地已经摘掉了，服务端那边最多多留一会儿；下次心跳复核也会清掉
+        warn!(proxy = %name, error = %e, "通知服务端关闭代理失败（本地已移除）");
+    }
+    if let Err(e) = store.remove(name) {
+        warn!(proxy = %name, error = %e, "从 store 删除失败（内存里已移除）");
+    }
+    info!(proxy = %name, r#type = %p.proxy_type, "管理界面移除代理");
+    Ok(format!("代理 [{name}] 已移除"))
+}
+
+// ---------------------------------------------------------------------------
+// 内容生成
+// ---------------------------------------------------------------------------
+
+fn ok_body(message: &str) -> String {
+    serde_json::json!({ "data": { "message": message } }).to_string()
+}
+
+fn err_body(code: &str, message: &str) -> String {
+    serde_json::json!({ "error": { "code": code, "message": message } }).to_string()
+}
+
+fn status_json(hub: &Arc<Hub>) -> String {
+    let sess = hub.session.borrow().clone();
+    let (connected, run_id, wire) = match &sess {
+        Some(s) => (true, s.run_id.to_string(), s.link.wire.to_string()),
+        None => (false, String::new(), String::new()),
+    };
+    let proxies: Vec<serde_json::Value> = hub
+        .proxies
+        .list()
+        .iter()
+        .map(|p| proxy_json(hub, p))
+        .collect();
+    serde_json::json!({
+        "data": {
+            "client_id": hub.cfg.client_id,
+            "user": hub.cfg.user,
+            "server": format!("{}:{}", hub.cfg.server_addr, hub.cfg.server_port),
+            "connected": connected,
+            "run_id": run_id,
+            "wire_protocol": wire,
+            "proxies": proxies,
+            "visitor_count": hub.cfg.visitors.len(),
+            // ★ v0.7.6：最近一次失败原因。自启动（隐藏窗口）时这是唯一能看到
+            // "为什么列表是空的"的地方。
+            "last_error": hub
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            "store": {
+                "enabled": hub.store.is_enabled(),
+                "path": hub
+                    .store
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                "dynamic": hub.store.dynamic_names(),
+            },
+            "features": {
+                "websocket": hub.cfg.websocket_enable,
+                "virtual_net": hub.cfg.virtual_net.is_enabled(),
+                "p2p": hub.cfg.p2p_port.is_some(),
+            },
+        }
+    })
+    .to_string()
+}
+
+fn proxies_json(hub: &Arc<Hub>) -> String {
+    let items: Vec<serde_json::Value> = hub
+        .proxies
+        .list()
+        .iter()
+        .map(|p| {
+            let mut v = proxy_json(hub, p);
+            // ★ v0.5.5（第四轮 F2/F3）：`dynamic` 改用**代理表自己的来源标记**，
+            // 而不是从 store 的名字列表间接推断。
+            //
+            // 原先写的是 `hub.store.dynamic_names().contains(&p.name)`：
+            // store 没配（`[store] path` 留空，默认）时它恒为空 ⇒
+            // 界面上"从面板加的代理"也会显示成非动态，用户据此以为删不掉。
+            // 现在直接问表里那条记录属于谁 —— 与"面板能不能删它"用的是
+            // **同一份事实**，不会再出现界面与实际能力不一致。
+            v["dynamic"] = serde_json::Value::Bool(
+                hub.proxies.origin_of(&p.name) == Some(crate::registry::ProxyOrigin::Dynamic),
+            );
+            v
+        })
+        .collect();
+    serde_json::json!({ "data": items }).to_string()
+}
+
+fn proxy_json(hub: &Hub, p: &ProxyConfig) -> serde_json::Value {
+    let reg = hub
+        .reg_states
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&p.name)
+        .cloned();
+    serde_json::json!({
+        "name": p.name,
+        "type": p.proxy_type,
+        "local_addr": p.local_addr,
+        "remote_port": p.remote_port,
+        "custom_domains": p.custom_domains,
+        "healthy": hub.health.is_healthy(&p.name),
+        // ★ v0.7.6：注册结果。`registered = false && error 空` 表示"还没收到
+        // 服务端回应"（注册中 / 控制连接刚断），面板据此区分三种状态。
+        "registered": reg.as_ref().map(|r| r.registered).unwrap_or(false),
+        "register_error": reg.as_ref().map(|r| r.error.clone()).unwrap_or_default(),
+    })
+}
+
+fn html_page() -> String {
+    r#"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NFrp 客户端</title>
+<style>
+  :root { color-scheme: light; }
+  body { margin:0; font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;
+         background:#f6f7f9; color:#1f2328; }
+  header { background:#0f6e56; color:#fff; padding:14px 22px; font-size:16px; }
+  main { max-width: 1000px; margin: 22px auto; padding: 0 18px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
+  .card { background:#fff; border:1px solid #d8dee4; border-radius:8px; padding:14px 16px; }
+  .card .k { font-size:12px; color:#6e7781; }
+  .card .v { font-size:18px; font-weight:600; margin-top:4px; word-break:break-all; }
+  section { margin-top: 26px; }
+  h2 { font-size:15px; margin:0 0 10px; padding-bottom:6px; border-bottom:1px solid #d8dee4; }
+  table { width:100%; border-collapse:collapse; background:#fff;
+          border:1px solid #d8dee4; border-radius:8px; overflow:hidden; }
+  th,td { text-align:left; padding:8px 12px; border-bottom:1px solid #eaeef2; font-size:13px; }
+  th { background:#f6f8fa; color:#57606a; font-weight:600; }
+  tr:last-child td { border-bottom:none; }
+  .empty { color:#6e7781; padding:12px; background:#fff; border:1px dashed #d8dee4; border-radius:8px; }
+  .tag { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; }
+  .on { background:#e1f5ee; color:#0f6e56; }
+  .off { background:#f1efe8; color:#5f5e5a; }
+  .bad { background:#fcebeb; color:#a32d2d; }
+  .notice { margin:12px 0 0; padding:10px 12px; background:#fff4e5; color:#7a4b00;
+            border:1px solid #f0c48a; border-radius:8px; font-size:13px;
+            white-space:pre-wrap; word-break:break-word; }
+  code { background:#eff1f3; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>NFrp 客户端管理</header>
+<main>
+  <div class="cards" id="cards"></div>
+  <div id="notice"></div>
+  <section>
+    <h2>代理</h2>
+    <div id="proxies"></div>
+  </section>
+  <section>
+    <h2>接口</h2>
+    <div class="empty">
+      <code>GET /api/status</code> 状态 ·
+      <code>GET /api/proxies</code> 代理表 ·
+      <code>POST /api/proxies/add</code> 新增（body 是代理的 JSON）·
+      <code>POST /api/proxies/remove</code> 移除（body 是代理名）
+    </div>
+  </section>
+</main>
+<script>
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+  });
+}
+function card(k, v) {
+  return '<div class="card"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + '</div></div>';
+}
+function refresh() {
+  fetch('api/status').then(function (r) { return r.json(); }).then(function (res) {
+    var d = res.data || {};
+    document.getElementById('cards').innerHTML =
+      card('连接状态', d.connected ? '已连接' : '未连接') +
+      card('服务端', d.server) +
+      card('线协议', d.wire_protocol || '-') +
+      card('run_id', d.run_id || '-') +
+      card('代理数', (d.proxies || []).length) +
+      card('Store', d.store && d.store.enabled ? '已启用' : '未启用');
+    var err = d.last_error || '';
+    document.getElementById('notice').innerHTML =
+      err ? '<div class="notice">最近一次会话失败：' + esc(err) + '</div>' : '';
+    var rows = (d.proxies || []).map(function (p) {
+      var h = p.healthy === false
+        ? '<span class="tag bad">不健康</span>'
+        : '<span class="tag on">正常</span>';
+      var reg = p.register_error
+        ? '<span class="tag bad">注册失败</span><br>' + esc(p.register_error)
+        : p.registered
+          ? '<span class="tag on">已注册</span>'
+          : (d.connected
+              ? '<span class="tag off">注册中</span>'
+              : '<span class="tag off">未连接</span>');
+      return '<tr><td>' + esc(p.name) + '</td><td>' + esc(p.type) + '</td><td>' +
+        esc(p.local_addr) + '</td><td>' + esc(p.remote_port || '-') + '</td><td>' +
+        esc((p.custom_domains || []).join(', ')) + '</td><td>' + reg + '</td><td>' + h + '</td></tr>';
+    }).join('');
+    document.getElementById('proxies').innerHTML = rows
+      ? '<table><tr><th>名字</th><th>类型</th><th>本地地址</th><th>远程端口</th><th>域名</th><th>注册</th><th>健康</th></tr>' + rows + '</table>'
+      : '<div class="empty">配置里没有任何代理（<code>[[proxies]]</code>）。' +
+        '在 <code>frpc.toml</code> 里添加后重启 frpc，或用 ' +
+        '<code>POST /api/proxies/add</code> 在线新增；' +
+        '当前服务端 ' + esc(d.server) + (d.connected ? '（已连接）' : '（未连接）') + '。</div>';
+  }).catch(function (e) {
+    document.getElementById('cards').innerHTML =
+      '<div class="card"><div class="k">错误</div><div class="v">' + esc(e) + '</div></div>';
+  });
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
+"#
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hub_with(proxies: ProxyTable) -> Arc<Hub> {
+        hub_with_cfg(proxies, ClientConfig::default())
+    }
+
+    fn hub_with_cfg(proxies: ProxyTable, cfg: ClientConfig) -> Arc<Hub> {
+        let cfg = Arc::new(cfg);
+        let store = Arc::new(Store::from_config(&cfg).expect("默认配置不落盘"));
+        let health = health::Monitor::start(&cfg);
+        let (_tx, rx) = tokio::sync::watch::channel::<Option<Arc<ClientSession>>>(None);
+        Hub::new(cfg, proxies, store, health, rx)
+    }
+
+    fn req(raw: &str) -> http1::Request {
+        http1::parse_str(raw)
+    }
+
+    /// route 的三元组响应：`(状态码, content-type, body)`。
+    type Resp = (u16, &'static str, String);
+
+    fn body_of(r: &Resp) -> serde_json::Value {
+        serde_json::from_str(&r.2).expect("响应必须是合法 JSON")
+    }
+
+    fn proxy(name: &str) -> ProxyConfig {
+        ProxyConfig {
+            name: name.into(),
+            proxy_type: "tcp".into(),
+            local_addr: "127.0.0.1:80".into(),
+            remote_port: 7000,
+            ..Default::default()
+        }
+    }
+
+    /// 真实起一个监听 socket，完整跑 `handle`，并读回响应。
+    ///
+    /// 用真 socket 而不是 duplex：`handle` 的响应是往它自己那条连接写的，
+    /// 只有真实连接才能把两个方向都拿到。
+    ///
+    /// ★★ v0.5.10 修（云端 Linux 实测，**测试侧**）：**不要在读完响应之前
+    /// `shutdown()` 写方向**。
+    ///
+    /// # 现象
+    ///
+    /// 云端（Linux）上这几个测试红了，而本机（Windows）一直绿：
+    ///
+    /// ```text
+    /// test web::tests::读请求不需要防伪头 ... FAILED
+    /// 读接口不该被挡，实际：                    ← 响应体**完全空白**
+    /// finished in 5.00s                         ← 正好 = 3s + 2s 两个超时之和
+    /// ```
+    ///
+    /// 串行跑（`--test-threads=1`）也红，**不是并发竞争**。
+    ///
+    /// # 根因（已用最小实验在云端证实）
+    ///
+    /// 把本函数的时序照抄进一个独立小工程（`tmp/experiments/shutdown_semantics`），
+    /// 在两种平台上跑五个变体：
+    ///
+    /// | 变体 | Windows | **Linux** |
+    /// |---|---|---|
+    /// | **A 照抄原写法**（write → shutdown → read） | ✅ 40B | ❌ **0B** |
+    /// | B 不 shutdown（write → read） | ✅ 40B | ✅ **40B** |
+    /// | C shutdown + yield 后再读 | ✅ 40B | ❌ **0B** |
+    /// | D shutdown + **服务端优雅收尾** | ✅ 40B | ✅ **40B** |
+    /// | E 不 shutdown + 服务端优雅收尾 | ✅ 40B | ✅ 40B |
+    ///
+    /// ⇒ **A 和 C 都失败、B 成功** ⇒ 罪魁是**客户端 `shutdown()`**；
+    ///   **D 成功**（同样 shutdown，但服务端先把响应 flush + shutdown 再 drop）
+    ///   ⇒ 服务端"写完直接 drop"是第二个促成因素。
+    ///
+    /// 机制：客户端半关写方向后，服务端回包并 `drop` 连接；
+    /// Linux 在 close 时若发送缓冲还有未确认数据 / 接收端已半关，
+    /// 会发 **RST** ⇒ 客户端内核**丢弃已排队但未读取的响应**。
+    /// Windows 的 TCP 栈在这条路径上不这样处理，所以本机永远测不出来。
+    ///
+    /// # 修法
+    ///
+    /// 走 **B 变体**：写完**不** shutdown，直接读到 EOF。
+    /// `handle` 自己会按 `Content-Length` 写完并关闭，客户端自然读到 EOF。
+    /// 这既修掉了平台差异，也更贴近真实浏览器的行为（浏览器不会在半路半关）。
+    /// 直接在同一进程里跑一次判定，**不碰 socket**。
+    ///
+    /// ★★ v0.5.10 重构（照官方 frp 的做法）：原先是 `handle_over_socket` ——
+    /// 开真 `TcpListener`、`tokio::spawn` 服务端、客户端再 `connect` 过去。
+    ///
+    /// 那个写法**自己造了一个竞态**：云端 Linux 实测（时间线插桩）
+    /// `accept()` 有时**永不返回**（`TL S2 accept 返回` 缺失），
+    /// 于是用到它的 4 个测试必然失败、每个卡满 5 秒；Windows 上却全绿。
+    ///
+    /// 官方 frp 测 HTTP 处理器时**不开 socket**：
+    /// `tmp/frp-0.71.0/server/http/controller_v2_test.go`
+    /// ```go
+    /// resp := httptest.NewRecorder()
+    /// handler.ServeHTTP(resp, req)
+    /// ```
+    /// 本函数与它同构：解析请求 → 调 `decide()` → 把结果拼成 HTTP 响应文本。
+    async fn decide_over_raw(hub: Arc<Hub>, raw: &str) -> String {
+        let req = http1::parse(raw.as_bytes());
+        let peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let d = decide(&hub, &req, peer).await;
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            d.code,
+            http1::reason(d.code),
+            d.ctype,
+            d.body.len(),
+            String::from_utf8_lossy(&d.body)
+        )
+    }
+    #[test]
+    fn 代理名两种写法都收() {
+        assert_eq!(proxy_name_of("  web  ").unwrap(), "web");
+        assert_eq!(proxy_name_of(r#"{"name":"web"}"#).unwrap(), "web");
+        assert!(proxy_name_of("").is_err());
+        assert!(proxy_name_of("   ").is_err());
+        assert!(proxy_name_of(r#"{"nope":1}"#).is_err(), "缺 name 要报错");
+        assert!(proxy_name_of("{不是 JSON").is_err());
+    }
+
+    /// `0.0.0.0` **不是**回环 —— 它恰恰是需要拦下的那一种。
+    ///
+    /// 注意 `localhost` 在新口径下也**不算回环**：它解析到哪个地址取决于
+    /// 本机 hosts 与 DNS，解析到非回环地址时就是一个对外端口，不能靠名字赌。
+    /// 所以配 `addr = "localhost"` 且不配密码同样会被拒绝启动。
+    #[test]
+    fn 回环地址识别() {
+        assert!(is_loopback_addr("127.0.0.1"));
+        assert!(is_loopback_addr("127.0.0.2"), "整个 127/8 都是回环");
+        assert!(is_loopback_addr("::1"));
+        assert!(!is_loopback_addr("0.0.0.0"));
+        assert!(!is_loopback_addr("192.168.1.5"));
+        assert!(!is_loopback_addr("localhost"), "名字解析结果不可控");
+        assert!(!is_loopback_addr(""));
+    }
+
+    /// ★ Origin 校验：只认本机明文来源。
+    #[test]
+    fn origin_只认本机来源() {
+        assert!(origin_is_local("http://127.0.0.1:7400"));
+        assert!(origin_is_local("http://127.0.0.1"));
+        assert!(origin_is_local("http://localhost:7400"));
+        assert!(origin_is_local("http://[::1]:7400"));
+
+        // 跨站来源一律拒
+        assert!(!origin_is_local("http://evil.com"));
+        assert!(!origin_is_local("https://evil.com"));
+        assert!(!origin_is_local("http://evil.com/127.0.0.1"));
+        assert!(!origin_is_local("null"), "沙箱 iframe 会发 Origin: null");
+        assert!(!origin_is_local(""));
+        // https 来源不可能是这个明文界面
+        assert!(!origin_is_local("https://127.0.0.1"));
+    }
+
+    /// ★ 写操作判定：GET/HEAD 不算写，不该被防伪头挡住。
+    #[test]
+    fn 写方法判定() {
+        assert!(is_write_method("POST"));
+        assert!(is_write_method("DELETE"));
+        assert!(!is_write_method("GET"));
+        assert!(!is_write_method("HEAD"));
+    }
+
+    /// ★ 回归测试：跨站来源的写请求必须被拒。
+    ///
+    /// 原先只看 Basic Auth（`user` 留空时连那层都没有）⇒ 恶意网页可以
+    /// 盲打 `POST /api/stop` 把客户端关掉，或用 DNS rebinding 伪装成
+    /// `http://evil.com` 增删隧道。
+    #[tokio::test]
+    async fn 跨站来源的写请求被拒绝() {
+        let hub = hub_with(ProxyTable::default());
+        let resp = decide_over_raw(
+            hub,
+            "POST /api/proxies/add HTTP/1.1\r\nHost: localhost\r\n\
+             Origin: http://evil.com\r\nX-Nfrp-Client: 1\r\n\
+             Content-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "跨站 Origin 必须 403，实际：{resp}"
+        );
+    }
+
+    /// ★ 回归测试：写请求缺防伪头必须被拒。
+    ///
+    /// 自定义头会触发 CORS 预检，而本界面不回应预检 ⇒ 网页根本发不出
+    /// 带这个头的跨站请求。
+    #[tokio::test]
+    async fn 写请求缺防伪头被拒绝() {
+        let hub = hub_with(ProxyTable::default());
+        let resp = decide_over_raw(
+            hub,
+            "POST /api/proxies/add HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "缺防伪头必须 403，实际：{resp}"
+        );
+        assert!(resp.contains("x-nfrp-client"), "错误里要点名该头：{resp}");
+    }
+
+    /// 带了防伪头 + 无 Origin（命令行场景）应当放行到业务逻辑。
+    #[tokio::test]
+    async fn 带防伪头的写请求能通过_csrf_检查() {
+        let hub = hub_with(ProxyTable::default());
+        let resp = decide_over_raw(
+            hub,
+            "POST /api/proxies/add HTTP/1.1\r\nHost: localhost\r\n\
+             X-Nfrp-Client: 1\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert!(
+            !resp.starts_with("HTTP/1.1 403"),
+            "带了防伪头就不该被 CSRF 挡住，实际：{resp}"
+        );
+        // 空 JSON 会被业务层拒（缺 name），那是 400 不是 403
+        assert!(resp.starts_with("HTTP/1.1 400"), "实际：{resp}");
+    }
+
+    /// 读操作不受 CSRF 检查影响（没有副作用）。
+    #[tokio::test]
+    async fn 读请求不需要防伪头() {
+        let hub = hub_with(ProxyTable::from_iter([proxy("web")]));
+        let resp =
+            decide_over_raw(hub, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "读接口不该被挡，实际：{resp}"
+        );
+        assert!(resp.contains("\"connected\""), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn 状态接口给出连接与代理() {
+        let hub = hub_with(ProxyTable::from_iter([proxy("web")]));
+        let r = route(
+            &hub,
+            "GET",
+            "/api/status",
+            &req("GET /api/status HTTP/1.1\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(r.0, 200);
+        let v = body_of(&r);
+        assert_eq!(v["data"]["connected"], false, "没有会话就是未连接");
+        assert_eq!(v["data"]["proxies"][0]["name"], "web");
+        assert_eq!(v["data"]["proxies"][0]["remote_port"], 7000);
+        assert_eq!(v["data"]["store"]["enabled"], false);
+        assert_eq!(v["data"]["features"]["websocket"], false);
+    }
+
+    /// 代理列表顺序必须**稳定**：面板每 3 秒刷新一次，
+    /// 顺序乱跳的话用户会以为自己在看不同的东西。
+    #[tokio::test]
+    async fn 代理列表按名字排序() {
+        let hub = hub_with(ProxyTable::from_iter([
+            proxy("zeta"),
+            proxy("alpha"),
+            proxy("mid"),
+        ]));
+        let r = route(
+            &hub,
+            "GET",
+            "/api/proxies",
+            &req("GET /api/proxies HTTP/1.1\r\n\r\n"),
+        )
+        .await;
+        let v = body_of(&r);
+        let names: Vec<&str> = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn 根路径给_html_页面() {
+        let hub = hub_with(ProxyTable::default());
+        let r = route(&hub, "GET", "/", &req("GET / HTTP/1.1\r\n\r\n")).await;
+        assert_eq!(r.0, 200);
+        assert!(
+            r.1.starts_with("text/html"),
+            "content-type 要是 html：{}",
+            r.1
+        );
+        assert!(r.2.to_lowercase().contains("nfrp"), "页面里要有标题");
+        assert!(r.2.contains("/api/status"), "页面要真的去拉状态接口");
+    }
+
+    #[tokio::test]
+    async fn 未知路径是_404_方法不对是_405() {
+        let hub = hub_with(ProxyTable::default());
+        let r = route(&hub, "GET", "/nope", &req("GET /nope HTTP/1.1\r\n\r\n")).await;
+        assert_eq!(r.0, 404);
+        assert_eq!(body_of(&r)["error"]["code"], "not_found");
+
+        let r = route(
+            &hub,
+            "POST",
+            "/api/status",
+            &req("POST /api/status HTTP/1.1\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(r.0, 405, "路径对、方法错应当 405 而不是 404");
+        assert_eq!(body_of(&r)["error"]["code"], "method_not_allowed");
+    }
+
+    /// 没有活跃会话时必须**立刻**给出人话错误，而不是让调用方干等 20 秒。
+    #[tokio::test]
+    async fn 未连接时写操作立刻失败() {
+        let hub = hub_with(ProxyTable::default());
+        let r = route(
+            &hub,
+            "POST",
+            "/api/proxies/add",
+            &req("POST /api/proxies/add HTTP/1.1\r\n\r\n\
+                 {\"name\":\"a\",\"type\":\"tcp\",\"local_addr\":\"127.0.0.1:80\"}"),
+        )
+        .await;
+        assert_eq!(r.0, 400);
+        let v = body_of(&r);
+        assert_eq!(v["error"]["code"], "add_failed");
+        assert!(
+            v["error"]["message"].as_str().unwrap().contains("没有连上"),
+            "错误要说清是没连上：{}",
+            v["error"]["message"]
+        );
+    }
+
+    /// 缺字段、重名这类问题要在**打到会话之前**就拦下 ——
+    /// 发过去也是被服务端拒绝，白跑一次往返，错误信息还没这里的清楚。
+    #[tokio::test]
+    async fn 新增的本地校验() {
+        let hub = hub_with(ProxyTable::from_iter([proxy("web")]));
+        const ADD: &str = "POST /api/proxies/add HTTP/1.1\r\n\r\n";
+
+        let r = route(
+            &hub,
+            "POST",
+            "/api/proxies/add",
+            &req(&format!(
+                "{ADD}{{\"name\":\"\",\"type\":\"tcp\",\"local_addr\":\"127.0.0.1:80\"}}"
+            )),
+        )
+        .await;
+        assert_eq!(r.0, 400);
+        assert!(
+            body_of(&r)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("name"),
+            "缺 name 要指名道姓：{}",
+            body_of(&r)["error"]["message"]
+        );
+
+        // `type` 在配置层有默认值（`tcp`），所以**缺了不报错** ——
+        // 必须和 TOML 走同一套默认值语义，否则同一份配置从文件读和从
+        // API 发会得到两种代理。这里能走到"没有连上"，就说明默认值生效了。
+        let r = route(
+            &hub,
+            "POST",
+            "/api/proxies/add",
+            &req(&format!(
+                "{ADD}{{\"name\":\"x\",\"local_addr\":\"127.0.0.1:80\"}}"
+            )),
+        )
+        .await;
+        assert_eq!(r.0, 400);
+        assert!(
+            body_of(&r)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("没有连上"),
+            "缺 type 应当按默认值 tcp 处理，而不是被拒：{}",
+            body_of(&r)["error"]["message"]
+        );
+
+        // 但显式写成空串是**用户的失误**，不能悄悄当 tcp 收下
+        let r = route(
+            &hub,
+            "POST",
+            "/api/proxies/add",
+            &req(&format!(
+                "{ADD}{{\"name\":\"x\",\"type\":\"\",\"local_addr\":\"127.0.0.1:80\"}}"
+            )),
+        )
+        .await;
+        assert!(
+            body_of(&r)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("type"),
+            "空 type 要点明：{}",
+            body_of(&r)["error"]["message"]
+        );
+
+        let r = route(
+            &hub,
+            "POST",
+            "/api/proxies/add",
+            &req(&format!(
+                "{ADD}{{\"name\":\"web\",\"type\":\"tcp\",\"local_addr\":\"127.0.0.1:80\"}}"
+            )),
+        )
+        .await;
+        assert!(
+            body_of(&r)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("已存在"),
+            "同名代理不该被放过去"
+        );
+
+        let r = route(&hub, "POST", "/api/proxies/add", &req(ADD)).await;
+        assert!(body_of(&r)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("不能为空"));
+
+        // `local_addr` 是必填字段（官方 frpc 也是），缺了要在解析阶段就报出来，
+        // 而不是收下一条"本地地址是空串"的代理 —— 那样服务端注册成功、
+        // 每次转发却都连不上，排查起来要绕一大圈。
+        let r = route(
+            &hub,
+            "POST",
+            "/api/proxies/add",
+            &req(&format!("{ADD}{{\"name\":\"x\",\"type\":\"tcp\"}}")),
+        )
+        .await;
+        assert_eq!(r.0, 400);
+        assert!(
+            body_of(&r)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("local_addr"),
+            "错误里要点明缺的是哪个字段：{}",
+            body_of(&r)["error"]["message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn 删除不存在的代理被拒() {
+        let hub = hub_with(ProxyTable::default());
+        let r = route(
+            &hub,
+            "POST",
+            "/api/proxies/remove",
+            &req("POST /x HTTP/1.1\r\n\r\nnope"),
+        )
+        .await;
+        assert_eq!(r.0, 400);
+        assert!(body_of(&r)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("没有代理"));
+    }
+
+    /// 没配 `user` 就不鉴权（默认只监听回环，所以这是安全的默认值）。
+    #[test]
+    fn 没配用户名就不鉴权() {
+        let hub = hub_with(ProxyTable::default());
+        assert!(auth_failure(&hub, &req("GET / HTTP/1.1\r\n\r\n")).is_none());
+    }
+
+    #[test]
+    fn 配了用户名就必须带对的凭证() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let mut c = ClientConfig::default();
+        c.web_server.user = "admin".into();
+        c.web_server.password = "pw".into();
+        let store = Arc::new(Store::from_config(&c).unwrap());
+        let health = health::Monitor::start(&c);
+        let (_tx, rx) = tokio::sync::watch::channel::<Option<Arc<ClientSession>>>(None);
+        let hub = Hub::new(Arc::new(c), ProxyTable::default(), store, health, rx);
+
+        assert!(
+            auth_failure(&hub, &req("GET / HTTP/1.1\r\n\r\n")).is_some(),
+            "没带 Authorization 必须拒"
+        );
+
+        let cred = STANDARD.encode("admin:pw");
+        let ok = format!("GET / HTTP/1.1\r\nAuthorization: Basic {cred}\r\n\r\n");
+        assert!(auth_failure(&hub, &req(&ok)).is_none(), "正确凭证要放行");
+
+        let bad = STANDARD.encode("admin:wrong");
+        let bad = format!("GET / HTTP/1.1\r\nAuthorization: Basic {bad}\r\n\r\n");
+        assert!(
+            auth_failure(&hub, &req(&bad)).is_some(),
+            "密码不对必须拒 —— 只比用户名等于把界面敞开"
+        );
+    }
+
+    #[tokio::test]
+    async fn pprof_默认关闭时返回_404() {
+        let hub = hub_with(ProxyTable::default());
+        let resp =
+            decide_over_raw(hub, "GET /debug/pprof/profile HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+        assert!(resp.contains("pprof disabled"), "{resp}");
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn pprof_windows_启用时明确返回_501() {
+        let mut cfg = ClientConfig::default();
+        cfg.web_server.pprof_enable = true;
+        let hub = hub_with_cfg(ProxyTable::default(), cfg);
+        let resp = decide_over_raw(
+            hub,
+            "GET /debug/pprof/profile?seconds=1 HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 501"), "{resp}");
+        assert!(resp.contains("only supported on Unix"), "{resp}");
+    }
+
+    /// ★★ v0.7.6 回归：面板必须能看到「为什么列表是空的」。
+    ///
+    /// 自启动是隐藏窗口，没有控制台；0.7.5 起进程又不再退出。若面板不暴露
+    /// 失败原因与注册结果，用户面对的就只有一个空列表 —— 这正是被报告的问题。
+    #[tokio::test]
+    async fn 面板暴露最近失败原因与代理注册结果() {
+        let table = ProxyTable::default();
+        table.load_dynamic([proxy("web")]);
+        let hub = hub_with(table);
+        hub.note_session_error("连接被拒绝：127.0.0.1:7000");
+        hub.note_proxy_err("web", "remote port 8080 not allowed");
+
+        let r = route(
+            &hub,
+            "GET",
+            "/api/status",
+            &req("GET /api/status HTTP/1.1\r\n\r\n"),
+        )
+        .await;
+        let j = body_of(&r);
+        assert_eq!(j["data"]["last_error"], "连接被拒绝：127.0.0.1:7000");
+        let p = &j["data"]["proxies"][0];
+        assert_eq!(p["name"], "web");
+        assert_eq!(p["registered"], false);
+        assert_eq!(p["register_error"], "remote port 8080 not allowed");
+
+        // 登录成功必须清掉上一轮的旧错误与旧注册结果
+        hub.on_session_started();
+        let r = route(
+            &hub,
+            "GET",
+            "/api/status",
+            &req("GET /api/status HTTP/1.1\r\n\r\n"),
+        )
+        .await;
+        let j = body_of(&r);
+        assert_eq!(j["data"]["last_error"], "");
+        assert_eq!(j["data"]["proxies"][0]["register_error"], "");
+    }
+
+    /// 页面必须真的把这些字段渲染出来（防止只加 API 不改页面）。
+    #[test]
+    fn 客户端面板渲染注册状态与空列表说明() {
+        let page = html_page();
+        assert!(page.contains("last_error"), "页面要读最近失败原因");
+        assert!(page.contains("register_error"), "页面要读注册错误");
+        assert!(
+            page.contains("[[proxies]]"),
+            "空列表必须给出可执行的说明，而不是一片空白"
+        );
+    }
+}
