@@ -994,8 +994,21 @@ async fn handle_conn(
                 .await
                 .context("WebSocket 升级失败（关闭连接）")?;
             info!(%peer, "WebSocket（明文）控制连接已建立");
-            // 升级之后就是一条普通流：yamux（若开启）与 frp 握手照旧。
-            return handle_stream(Box::pin(ws), peer, cfg, registry, false).await;
+            // ★ WS 之内往往**还有一层 TLS**：官方 frpc 的 `transport.tls.enable`
+            //   默认是 true（`defaultTrue`），所以 `protocol = "websocket"` 的
+            //   客户端会先发 `GET /~!frp` 明文升级，升级成功后再在 WS 流里发
+            //   TLS ClientHello（首字节 0x16）。实测 frpc 0.71.0 就是这样：
+            //   少了这一层，服务端会把 0x16 当成 frp 消息类型字节，回一句
+            //   「未知的 frp v1 消息类型字节 0x16」然后断开。
+            //
+            //   反过来，客户端显式关掉 tls.enable 时这里是明文 frp 流 ——
+            //   `accept_server` 对非 TLS 首字节会原样回放，两种都能走。
+            //   注意 `force` 传 false：WS 这条路径不能因为 tls_force 就把
+            //   明文 WS 客户端拒掉（官方在 WS 之后也不看 force）。
+            let stream = frp::tls::accept_server(Box::pin(ws), true, false)
+                .await
+                .context("WebSocket 内层 TLS 协商失败")?;
+            return handle_stream(stream, peer, cfg, registry, false).await;
         }
         // 前缀不匹配：字节已全部回放，按普通连接继续（保持原版行为）。
         let stream = frp::tls::accept_server(stream, true, cfg.tls_force)
@@ -1020,7 +1033,13 @@ async fn handle_conn(
             .await
             .context("WSS 升级失败（关闭连接）")?;
         info!(%peer, "WSS（TLS 内 WebSocket）控制连接已建立");
-        return handle_stream(Box::pin(ws), peer, cfg, registry, false).await;
+        // 同明文 WS 分支：官方客户端在 WSS 里**不再**套第二层 TLS（外层已经是
+        // TLS 了），但 `accept_server` 对非 TLS 首字节原样回放，所以这一层
+        // 对 wss 是无损的 —— 它只是让"wss 之外还想再套一层"的客户端也能用。
+        let stream = frp::tls::accept_server(Box::pin(ws), true, false)
+            .await
+            .context("WSS 内层 TLS 协商失败")?;
+        return handle_stream(stream, peer, cfg, registry, false).await;
     }
     handle_stream(stream, peer, cfg, registry, false).await
 }
