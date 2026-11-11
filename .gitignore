@@ -27,4 +27,6 @@ __pycache__/
 
 # 第三方二进制（Wintun 驱动），由用户自行下载：https://www.wintun.net/
 /assets/wintun.dll
+# GitHub Actions 模板保存在 ci/ 下（当前令牌无 workflow 权限，无法直接推 .github/workflows/）。
+# 启用 CI 时把 ci/*.yml 复制到 .github/workflows/ 再提交，详见 ci/README.md。
 /.github/workflows/

@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.suffix }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows_amd64
+            exe: ".exe"
+            archive: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            suffix: linux_amd64_musl
+            exe: ""
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: darwin_arm64
+            exe: ""
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: musl toolchain (Linux)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: cargo build --release
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pkg
+          cp "target/${{ matrix.target }}/release/nfrp-server${{ matrix.exe }}" "pkg/frps${{ matrix.exe }}"
+          cp "target/${{ matrix.target }}/release/nfrp-client${{ matrix.exe }}" "pkg/frpc${{ matrix.exe }}"
+          cp assets/frps.toml assets/frpc.toml README.md LICENSE NOTICE pkg/
+          cp -R docs pkg/
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            (cd pkg && powershell -NoProfile -Command "Compress-Archive -Path * -DestinationPath ../frp_${{ matrix.suffix }}.zip -Force")
+          else
+            tar -C pkg -czf "frp_${{ matrix.suffix }}.tar.gz" .
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frp-${{ matrix.suffix }}
+          path: frp_${{ matrix.suffix }}.*
+          if-no-files-found: error
+
+  publish:
+    name: publish assets + SHA256SUMS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: frp-*
+          merge-multiple: true
+          path: all
+      - name: checksums
+        run: |
+          cd all
+          sha256sum frp_* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            all/frp_*
+            all/SHA256SUMS.txt
+          fail_on_unmatched_files: true
