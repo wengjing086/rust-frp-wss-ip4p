@@ -194,6 +194,7 @@ fn proxy_v2_json(p: &ProxyStat) -> serde_json::Value {
             "bandwidthLimit": "",
             "bandwidthLimitMode": "bandwidth",
         },
+        "loadBalancer": { "group": "" },
     });
     let block = match p.proxy_type.as_str() {
         "tcp" | "udp" => {
@@ -225,6 +226,15 @@ fn proxy_v2_json(p: &ProxyStat) -> serde_json::Value {
             serde_json::json!({ key: b })
         }
         other => serde_json::json!({ other: base }),
+    };
+    // 官方 V2ProxySpec 是带 `type` 判别字段的联合类型：
+    // `{"type":"stcp","stcp":{...}}`。前端 `getActiveProxySpec` 先按
+    // `spec.type` 分派，缺了 `type` 会直接落进 assertNever 抛
+    // "Unsupported proxy spec"。
+    let block = {
+        let mut obj = block.as_object().cloned().unwrap_or_default();
+        obj.insert("type".into(), serde_json::json!(p.proxy_type));
+        serde_json::Value::Object(obj)
     };
     serde_json::json!({
         "name": p.name,
@@ -587,4 +597,40 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats::ProxyStats;
+
+    /// 官方面板 `getActiveProxySpec` 按 `spec.type` 分派；漏掉这个判别字段
+    /// 会让前端抛 "Unsupported proxy spec"。回归保护。
+    #[test]
+    fn v2_proxy_spec_has_type_discriminator() {
+        let stats = ProxyStats::default();
+        stats.open(
+            "win_rdp_stcp_xnj",
+            "stcp",
+            "xnj",
+            "c1",
+            serde_json::json!({"useEncryption": false, "useCompression": false}),
+        );
+        let p = stats.get("win_rdp_stcp_xnj").unwrap();
+        let body = proxy_v2_json(&p);
+        let spec = &body["spec"];
+        assert_eq!(spec["type"], "stcp", "spec 必须带 type 判别字段：{spec}");
+        assert!(
+            spec["stcp"].is_object() && spec["stcp"]["transport"].is_object(),
+            "spec 必须带同名的类型块：{spec}"
+        );
+        assert_eq!(spec["stcp"]["loadBalancer"]["group"], "");
+
+        // tcp 类型的 remotePort 也应落在自己的块里。
+        stats.open("rdp", "tcp", "u", "c2", serde_json::json!({"remotePort": 6010}));
+        let body = proxy_v2_json(&stats.get("rdp").unwrap());
+        let spec = &body["spec"];
+        assert_eq!(spec["type"], "tcp");
+        assert_eq!(spec["tcp"]["remotePort"], 6010);
+    }
 }
