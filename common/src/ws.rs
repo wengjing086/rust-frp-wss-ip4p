@@ -396,6 +396,21 @@ pub struct WsStream<S> {
     tx: Vec<u8>,
     /// `tx` 里已经写出去的字节数。
     tx_off: usize,
+    /// `tx` 里那一帧**对应的调用方 buf 长度**（还没回报给调用方时是 `Some`）。
+    ///
+    /// ★★ v0.8.3 修（高危，数据损坏）：`AsyncWrite` 的约定是"返回 `Pending`
+    /// 就必须用**同一份 buf** 重试"。原实现把整帧入队后才去写，写不完就返回
+    /// `Pending`，重试时先把残留帧冲完、**然后又照着同一个 buf 排了一帧**
+    /// ——同一段数据被写了两遍。
+    ///
+    /// 帧里装的是 yamux 的「12 字节头 / 载荷」，多写一份就等于把重复的头
+    /// 喂给对端的载荷解析，帧边界整条错位（表现就是
+    /// `yamux 会话错误：decode error: unknown version: <任意字节>`）。
+    /// 只有 socket 写满（高流量）时才会走 `Pending` 分支，所以症状是
+    /// "流量一大就断"，空闲时完全看不出来。
+    ///
+    /// 有值表示"这一帧已经在路上，别再建帧，冲完直接回报这个长度"。
+    tx_pending_len: Option<usize>,
     /// 已收到对端的 Close。
     closed: bool,
 }
@@ -421,6 +436,7 @@ impl<S> WsStream<S> {
             raw: leftover,
             tx: Vec::new(),
             tx_off: 0,
+            tx_pending_len: None,
             closed: false,
         }
     }
@@ -673,18 +689,42 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WsStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.as_mut().get_mut();
-        // 先把上一次没写完的帧冲干净
-        if let Poll::Ready(()) = this.poll_drain(cx)? {
-            // 新数据：整帧写出去才算消费
-            let frame = build_frame(OP_BINARY, buf, this.is_client);
-            this.tx = frame;
-            this.tx_off = 0;
+
+        // ① 上一帧还没回报给调用方：先冲完残留字节，再回报它的长度。
+        //
+        //    必须回报而不是重新建帧 —— `AsyncWrite` 规定 `Pending` 之后调用方
+        //    会用同一份 buf 重试，重新建帧就会把同一段数据写两遍
+        //    （见 `tx_pending_len` 的注释）。
+        //
+        //    注意这里只看 `tx_pending_len`，不看 `tx` 是否为空：读侧回 Pong 时
+        //    可能顺手把残留帧冲干净了，此时 `tx` 已空但长度**仍欠**调用方一次回报。
+        if this.tx_pending_len.is_some() {
             match this.poll_drain(cx)? {
-                Poll::Ready(()) => Poll::Ready(Ok(buf.len())),
-                Poll::Pending => Poll::Pending,
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => {
+                    return Poll::Ready(Ok(this.tx_pending_len.take().unwrap_or(0)));
+                }
             }
-        } else {
-            Poll::Pending
+        }
+
+        // ② 只有控制帧残留（Pong / Close）：冲干净，不涉及调用方 buf。
+        if this.tx_off < this.tx.len() {
+            match this.poll_drain(cx)? {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => {}
+            }
+        }
+
+        // ③ 新数据：整帧入队并尽力写出去。
+        let n = buf.len();
+        this.tx = build_frame(OP_BINARY, buf, this.is_client);
+        this.tx_off = 0;
+        match this.poll_drain(cx)? {
+            Poll::Ready(()) => Poll::Ready(Ok(n)),
+            Poll::Pending => {
+                this.tx_pending_len = Some(n);
+                Poll::Pending
+            }
         }
     }
 
@@ -791,6 +831,66 @@ mod tests {
         let n = ws.read(&mut back).await.unwrap();
         assert_eq!(&back[..n], b"hello-ws");
         assert_eq!(server.await.unwrap(), b"hello-ws");
+    }
+
+    /// ★ v0.8.3 的核心修复：底层写满（`Pending`）时**不能把同一段数据写两遍**。
+    ///
+    /// # 为什么这条用例必须存在
+    ///
+    /// 症状是"流量一大就断"，空闲时完全正常 —— 因为只有 socket 发送缓冲被写满
+    /// （`tokio::io::duplex` 的 64 字节上限就是它的极端版）才会走 `Pending`
+    /// 分支，而 `AsyncWrite` 规定 `Pending` 之后调用方用**同一份 buf** 重试。
+    /// 原实现在重试时又重新建了一帧，等于把 yamux 的「头 / 载荷」各写两份，
+    /// 对端于是从载荷中间开始按帧头解析，报
+    /// `yamux 会话错误：decode error: unknown version: <任意字节>` 后整条会话死掉。
+    #[tokio::test]
+    async fn pending_重试时不能重复发帧() {
+        // 底层容量故意开小：一次 poll_write 必然写不完 → 一定触发 Pending 重试。
+        let (a, b) = tokio::io::duplex(64);
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        let expect = payload.clone();
+
+        let writer = tokio::spawn(async move {
+            let mut ws = WsStream::new(a, true, Vec::new());
+            tokio::io::AsyncWriteExt::write_all(&mut ws, &payload)
+                .await
+                .expect("写");
+            tokio::io::AsyncWriteExt::flush(&mut ws).await.expect("flush");
+            tokio::io::AsyncWriteExt::shutdown(&mut ws)
+                .await
+                .expect("shutdown");
+        });
+
+        let mut reader = WsStream::new(b, false, Vec::new());
+        let mut got = Vec::new();
+
+        // ★ 必须带超时，否则这条用例在**未修复**的实现上是"挂死"而不是"失败"。
+        //
+        // 实测：把 poll_write 里那行改回 `if false && this.tx_pending_len.is_some()`
+        // 之后，本测试**跑了 237 秒 CPU 仍不返回**（最后只能 taskkill）。
+        // 原因是每次重试都执行 `this.tx = build_frame(..)`，把 `tx_off` 归零 ⇒
+        // 已经写出去的那几十字节进度被丢弃 ⇒ 8 KiB 永远写不完，`write_all`
+        // 一直重试。没有超时的用例只会让 CI 卡住，看不出是哪条坏了。
+        //
+        // 正常实现下这一步是毫秒级（64 字节容量 × 约 130 轮）。
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            reader.read_to_end(&mut got).await.expect("读");
+            writer.await.expect("writer 任务");
+        })
+        .await
+        .expect(
+            "8 KiB 写了 10 秒还没完 —— poll_write 在 Pending 的重试路径上重复建帧、\
+             把写入进度清零了（这正是 yamux 报 unknown version 的根因）",
+        );
+
+        assert_eq!(
+            got.len(),
+            expect.len(),
+            "收到 {} 字节，应为 {} —— 差这么多说明帧被重复写了",
+            got.len(),
+            expect.len()
+        );
+        assert_eq!(got, expect, "内容必须逐字节一致（重复写会整体错位）");
     }
 
     /// ★ v0.8.1 的核心修复：握手请求**必须带 `Origin` 头**。

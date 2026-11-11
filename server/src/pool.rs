@@ -110,6 +110,29 @@ pub struct PendingUser {
     ///
     /// 这里直接存**派生结果**而不是 token 本身：bridge 那一层不该接触明文 token。
     pub data_key: Option<[u8; 16]>,
+    /// **visitor 侧**的数据面密钥（stcp / xtcp 专用，`Some` 表示要对访客那条流
+    /// 解/加密）。
+    ///
+    /// # 为什么需要第二个密钥
+    ///
+    /// 官方的数据面加密是**逐跳**的，两条跳用**不同的密钥**：
+    ///
+    /// ```text
+    /// 访客 ⟷ frps ⟷ provider(frpc)
+    ///        ↑         ↑
+    ///   secretKey     token 派生（Auth.EncryptionKey）
+    /// ```
+    ///
+    /// * `server/proxy/proxy.go`：`libio.WithEncryption(local, pxy.encryptionKey)`；
+    /// * `server/visitor/visitor.go`：`libio.WithEncryption(rwc, []byte(l.sk))`。
+    ///
+    /// 也就是说 frps 不是"密文透传"，而是**两侧各自解一次、再各自加一次**。
+    /// 旧实现把这里写死成 `None`（误以为加密是端到端、服务端只搬字节），
+    /// 于是 provider 加密后的字节被原样交给访客 —— 实测表现是
+    /// 「visitor 接入成功、上行有字节、下行 0B」，RDP 握手永远等不到响应。
+    pub visitor_key: Option<[u8; 16]>,
+    /// visitor 侧是否压缩（`NewVisitorConn.use_compression`）。
+    pub visitor_compression: bool,
     pub remote_port: u16,
     pub stream: BoxStream,
     pub peer: SocketAddr,
@@ -1045,6 +1068,8 @@ mod tests {
             use_encryption: false,
             use_compression: false,
             data_key: None,
+            visitor_key: None,
+            visitor_compression: false,
             remote_port: 0,
             stream: Box::pin(tokio::io::empty()),
             peer: SocketAddr::from(([127, 0, 0, 1], 1234)),

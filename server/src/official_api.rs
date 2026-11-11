@@ -171,7 +171,12 @@ fn client_conns_and_proxies(registry: &Registry, client_id: &str) -> (i64, i64) 
 fn proxy_stats_json(p: &ProxyStat) -> serde_json::Value {
     let (tin, tout) = p.today_in_out();
     serde_json::json!({
+        // ★ v0.8.5：`name` / `type` 必须在**顶层**。
+        //   官方 `ProxyInfoResp` 就是这两个字段在最外层，`conf` 只是原始配置
+        //   —— 之前只把 name/type 留在 conf 里，按官方结构写的第三方面板 /
+        //   脚本读 `item.name` 会拿到 undefined，只能靠翻 conf 才能用。
         "name": p.name,
+        "type": p.proxy_type,
         "conf": p.conf,
         "user": p.user,
         "clientID": p.client_id,
@@ -542,8 +547,14 @@ pub async fn route(
 
     // /api/v2/clients/{key}
     if let Some(key) = path.strip_prefix("/api/v2/clients/") {
+        // ★ v0.8.5：写接口（`/clients/kick`）不归这里管，交回自有 api_v2。
+        //
+        // 之前这里对任何非 GET 都直接回 405 —— 而 `POST /api/v2/clients/kick`
+        // 的 path 同样以 `/api/v2/clients/` 开头，于是"踢客户端"被这条
+        // 前缀规则整个挡死（返回 `{"code":405,"msg":"method not allowed"}`，
+        // 前端只看到"操作失败"）。返回 `None` 让后面的 api_v2 接着处理。
         if method != "GET" {
-            return Some(v2_error(405, "method not allowed"));
+            return None;
         }
         let key = percent_decode(key);
         return Some(match registry.sessions.get(&key) {
@@ -563,13 +574,15 @@ pub async fn route(
 
     // /api/v2/proxies/{name}/traffic 与 /api/v2/proxies/{name}
     if let Some(rest) = path.strip_prefix("/api/v2/proxies/") {
+        // ★ v0.8.5：同上 —— `/proxies/add` 与 `/proxies/remove` 也是这个前缀，
+        // 必须放行给 api_v2 的写接口，否则面板的"动态加/删代理"全都 405。
+        if method != "GET" {
+            return None;
+        }
         let (name, traffic) = match rest.strip_suffix("/traffic") {
             Some(n) => (percent_decode(n), true),
             None => (percent_decode(rest), false),
         };
-        if method != "GET" {
-            return Some(v2_error(405, "method not allowed"));
-        }
         return Some(match stats.get(&name) {
             Some(p) if traffic => v2_ok(traffic_v2_json(&p)),
             Some(p) if !traffic => v2_ok(proxy_v2_json(&p)),
@@ -632,5 +645,36 @@ mod tests {
         let spec = &body["spec"];
         assert_eq!(spec["type"], "tcp");
         assert_eq!(spec["tcp"]["remotePort"], 6010);
+    }
+
+    /// v0.8.5 回归：`/api/v2/proxies/{x}` 与 `/api/v2/clients/{x}` 的前缀规则
+    /// **不能吞掉写接口**。
+    ///
+    /// 原实现里这两个分支对任何非 GET 都返回 405，而 `/api/v2/proxies/add`、
+    /// `/api/v2/proxies/remove`、`/api/v2/clients/kick` 的路径恰好都以它们为前缀
+    /// ⇒ 面板的"动态加代理 / 删代理 / 踢客户端"全部失效（前端只看到 405）。
+    ///
+    /// 修法：非 GET 时返回 `None`，把请求交回 `api_v2`。这个测试锁住"必须返回
+    /// None"，否则又会被改回 405。
+    #[tokio::test]
+    async fn 写接口路径不被单条查询前缀吞掉() {
+        let reg = Arc::new(Registry::unlimited());
+        let cfg = Arc::new(ServerConfig::default());
+
+        for path in [
+            "/api/v2/proxies/add",
+            "/api/v2/proxies/remove",
+            "/api/v2/clients/kick",
+        ] {
+            let r = route(&reg, &cfg, "POST", path, "").await;
+            assert!(
+                r.is_none(),
+                "{path} 的 POST 必须交回 api_v2 处理，不能被 official_api 回 405"
+            );
+        }
+
+        // GET 单条查询仍归这里，别改坏了。
+        let r = route(&reg, &cfg, "GET", "/api/v2/proxies/add", "").await;
+        assert!(r.is_some(), "GET 查询仍应由 official_api 接管");
     }
 }

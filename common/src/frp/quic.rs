@@ -29,7 +29,31 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::frp::tls::crypto_provider;
 
 /// QUIC 的 ALPN 标识。
-pub const ALPN: &[u8] = b"nfrp-frp";
+///
+/// ★ 必须与官方 frp 一致（`frp`）。官方 frpc / frps 的 QUIC 握手用
+/// `tlsConfig.NextProtos = []string{"frp"}`（见上游 `client/connector.go:124`、
+/// `server/service.go:268`），ALPN 不一致时 QUIC 会直接以
+/// `cryptographic handshake failed: error 120` 断开，且日志里看不出原因。
+///
+/// 早期版本用的是 `nfrp-frp`，所以两端都**同时接受**两个标识：
+/// 老版本 nfrp 客户端仍能连，官方客户端也能连。
+pub const ALPN: &[u8] = b"frp";
+/// 0.8.5 及更早版本使用的私有 ALPN，仅为向后兼容保留。
+pub const ALPN_LEGACY: &[u8] = b"nfrp-frp";
+
+/// 一次握手允许的 ALPN 列表：标准 frp 标识优先，旧私有标识兜底。
+///
+/// rustls 由**服务端**在它自己的列表里挑第一个客户端也支持的项，
+/// 所以两侧都给出同一组即可，无论谁新谁旧都能协商成功。
+fn alpn_family(alpn: &[u8]) -> Vec<Vec<u8>> {
+    if alpn == ALPN {
+        vec![ALPN.to_vec(), ALPN_LEGACY.to_vec()]
+    } else if alpn == ALPN_LEGACY {
+        vec![ALPN_LEGACY.to_vec(), ALPN.to_vec()]
+    } else {
+        vec![alpn.to_vec()]
+    }
+}
 /// 服务端名字：证书自签且跳过校验，但 rustls 要求它是合法 DNS 名。
 pub const SERVER_NAME: &str = "nfrp.frp";
 
@@ -77,7 +101,7 @@ pub fn server_config(alpn: &[u8]) -> Result<quinn::ServerConfig> {
                 .map_err(|e| anyhow!("转换 QUIC 私钥失败：{e}"))?,
         )
         .context("构造 QUIC 服务端 TLS 配置失败")?;
-    tls.alpn_protocols = vec![alpn.to_vec()];
+    tls.alpn_protocols = alpn_family(alpn);
 
     let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|e| anyhow!("构造 QUIC 服务端配置失败：{e}"))?;
@@ -139,7 +163,7 @@ pub fn client_config(alpn: &[u8]) -> Result<quinn::ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipVerify))
         .with_no_client_auth();
-    tls.alpn_protocols = vec![alpn.to_vec()];
+    tls.alpn_protocols = alpn_family(alpn);
 
     let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
         .map_err(|e| anyhow!("构造 QUIC 客户端配置失败：{e}"))?;
@@ -578,12 +602,35 @@ mod tests {
         );
     }
 
+    /// ALPN 必须与官方 frp 一致 —— 这是 QUIC 能不能跨实现互通的唯一开关。
+    ///
+    /// 踩过的坑：私有标识 `nfrp-frp` 让官方客户端/服务端的 QUIC 握手直接
+    /// `cryptographic handshake failed: error 120`，两端日志都看不出原因。
+    #[test]
+    fn alpn_matches_official_frp() {
+        assert_eq!(
+            ALPN,
+            b"frp",
+            "官方 frp 的 QUIC NextProtos 写死为 frp，改了就不通"
+        );
+        let family = alpn_family(ALPN);
+        assert_eq!(family[0], b"frp".to_vec(), "标准标识要排在前面");
+        assert!(
+            family.contains(&ALPN_LEGACY.to_vec()),
+            "旧客户端的 nfrp-frp 也必须继续被接受"
+        );
+        // 反过来：老配置（写 nfrp-frp）同样要能协商到标准标识
+        let legacy = alpn_family(ALPN_LEGACY);
+        assert!(legacy.contains(&ALPN.to_vec()));
+        // NLink 自己的 ALPN 不能被污染
+        assert_eq!(alpn_family(b"nfrp-nlink"), vec![b"nfrp-nlink".to_vec()]);
+    }
+
     /// 握手失败必须**换个本地端口重试**若干次，而不是一次就放弃。
     ///
     /// 回归的是云端实测：宿主上的第三方 DPI 会偶发吞掉新建 UDP 流的头几个包，
     /// 而且吞法是**按流**的 —— 同一条流上重传多少遍都没用，换一个源端口立刻通。
     /// 所以 `connect` 的语义是"换端口多试几次"，这里断言它真的试满了次数：
-    /// 错误里必须写明试了几次（那正是循环跑满的证据）。
     #[tokio::test]
     async fn connect_retries_before_giving_up() {
         // 同样保持 socket 存活，避免并行用例复用端口后"假连接成功"。

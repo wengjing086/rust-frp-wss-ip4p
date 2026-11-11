@@ -206,38 +206,65 @@ Go 版 frp 常被报成 `HackTool:Win32/Frp` 之类，主因是 Go 运行时特�
 
 ## 与官方 Go 版 frp 的互通性
 
-不是"声称兼容"，是拿**官方 frp 0.71.0 的真实二进制**跑出来的。两组进程都喂同一份
-官方格式配置（`camelCase` / `[[proxies]]` / `transport.*`），判据是数据面真的通：
-浏览器侧 `GET http://127.0.0.1:<remotePort>/` 必须拿回后端返回的内容。
+不是"声称兼容"，是拿**官方 frp 0.71.0 的真实二进制**双向跑出来的。判据是数据面真的通：
+隧道里一个来回的字节必须原样回来，标了"8 MiB"的项还要整段 sha256 对齐。
+脚本在 `_interop/compat_go.py`（`python _interop/compat_go.py`），可以自己复跑。
 
-| 服务端 | 客户端 | tcp | tls | websocket | wss |
-|---|---|---|---|---|---|
-| **本项目 frps** | **本项目 frpc** | ✅ | ✅ | ✅ | ✅ |
-| **本项目 frps** | 官方 go frpc 0.71.0 | ✅ | ✅ | ✅ | ✅ |
-| 官方 go frps 0.71.0 | 官方 go frpc 0.71.0 | ✅ | ✅ | ✅ | ❌ |
-| 官方 go frps 0.71.0 | 本项目 frpc | ✅ | ✅ | ❌ | ✅ |
+### 代理类型
 
-每一格都是启动两个真实进程、经隧道 `GET` 到后端返回内容才算 ✅。
+| 服务端 | 客户端 | tcp | udp | http | https | tcpmux | stcp | sudp | xtcp |
+|---|---|---|---|---|---|---|---|---|---|
+| **本项目 frps** | 官方 go frpc 0.71.0 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 官方 go frps 0.71.0 | 本项目 frpc | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 
-两个反直觉的格子值得单独说明，它们都源于**同一条事实**：两套实现对
-`websocket` / `wss` 的分层顺序相反。
+`stcp` 这一列是**四种组合全过**（谁做 provider、谁做 visitor 各测一遍，含 8 MiB 全量）。
+混搭环境里要加密点对点，就选它 —— 数据经服务端转发，不依赖打洞。
 
-- 官方：`websocket` = 明文 WS 升级 + **WS 内层**再套 TLS（`tls.enable` 默认 true）；
-  `wss` = **TLS 在外层** + WS。
-- 本项目 frpc：`wss` = 明文 WS 升级 + **WS 内层**套 TLS。
+`xtcp` 的 ✅ 只覆盖**两端同源**（都官方、或都本项目）。跨实现不行，因为牵线协议是两套：
 
-于是：
+- 官方 `xtcp` 的 provider 只在**工作连接**上读 `NatHoleSid`，压根不接中继数据；
+  官方 visitor 也没有"打洞失败回退中继"这条路（`open tunnel timeout` 就结束）。
+- 本项目的打洞是 frps `p2pPort` 上的 HELLO 牵线 + QUIC/KCP 直连；
+  官方 frps 上没有这个 UDP 服务。
+- 于是 `rust visitor + 官方 provider` 能接入中继，但官方 provider 那边 `read workConn: EOF`；
+  `官方 visitor + rust provider` 则卡在服务端等 `NatHoleClient` 直到超时。
 
-1. **官方 frps 那一行 wss 是 ❌，而且官方自己连自己也是 ❌**。因为官方 frps 只在
-   明文层嗅探 `GET /~!frp`，外层 TLS 的 wss 永远匹配不上。这不是客户端问题 ——
-   换成本项目 frps 就能直连 `bindPort`，不用挂 nginx。
-2. **本项目 frpc → 官方 frps 的 wss 反而是 ✅**。我们的 wss 把 TLS 放在 WS 内层，
-   官方 frps 先看到明文升级请求、命中嗅探，之后才进 TLS —— 正好绕开了官方的缺口。
-   代价是同一条路径下的 `websocket`（明文、无内层 TLS）会 ❌，因为官方 frps 升级后
-   期待的是 TLS 首字节。
+0.8.6 起这两种情况都会在日志里给出一行明确的 WARN 并指向 `stcp`，不再是干等超时。
 
-混搭时最稳的组合是 `tcp` 与 `tls`，四种组合全绿；需要穿 HTTP 中间件再用 ws/wss，
-并按上表挑方向。
+### 传输层
+
+| 服务端 | 客户端 | tcp | tls | websocket | wss | quic | kcp |
+|---|---|---|---|---|---|---|---|
+| **本项目 frps** | **本项目 frpc** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **本项目 frps** | 官方 go frpc 0.71.0 | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| 官方 go frps 0.71.0 | 官方 go frpc 0.71.0 | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| 官方 go frps 0.71.0 | 本项目 frpc | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
+
+三个反直觉的格子，都值得单独说明。
+
+**1. wss 那一列：官方 frps 连自己也不支持直连。**
+官方 frps 是在 **TLS 之前**按明文前缀 `GET /~!frp` 嗅探 WebSocket 的
+（`server/service.go` 的 mux 前缀匹配）。`wss` 首字节是 `0x16`，会被当成普通 frp 连接
+丢给 yamux，日志里只剩一句 `accept new mux stream error: invalid protocol version`。
+官方文档的解法是前面挂 nginx/caddy 终结 TLS。
+本项目的 frps **两种顺序都认**，所以 `官方 frpc --wss--> 本项目 frps` 是通的，可以省掉 nginx；
+反方向（本项目 frpc → 官方 frps）受官方限制，同样不通。
+
+**2. quic 那一列是 0.8.6 修出来的。**
+QUIC 的 ALPN 之前用的是私有标识 `nfrp-frp`，官方用的是 `frp`
+（`client/connector.go` 与 `server/service.go` 里写死的 `NextProtos`）。
+ALPN 不一致时 QUIC 直接以 `cryptographic handshake failed: error 120` 断开，
+两端日志都看不出原因 —— 表现为"QUIC 就是连不上"。
+现在两端同时接受 `frp` 与 `nfrp-frp`，官方客户端/服务端都能直连，旧版本 nfrp 也不受影响。
+
+**3. kcp 不支持跨实现，是设计选择。**
+本项目的 KCP 是 `ikcp` / `kcp-go` 的精简移植，只实现两端都用得到的部分
+（分片重组、UNA/ACK、快速重传），**没有 FEC**，也没做 kcp-go 的会话握手；
+`common/src/frp/kcp.rs` 的模块注释里写得很明白："两端都是 nfrp，所以不需要与 kcp-go
+的字节流严格对齐"。官方 frp 的 KCP 默认带 FEC 150/3，字节层面就对不上。
+跨官方请用 `tcp` / `tls` / `websocket` / `quic`。
+
+混搭时最稳的是 `tcp` 与 `tls`，四种组合全绿。
 
 
 ## 兼容性与限制

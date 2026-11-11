@@ -805,7 +805,15 @@ pub fn start_session(
             }
         }
         // 官方写完 Sid 就关闭工作连接；provider 的数据面走 UDP。
-        drop(work_conn);
+        //
+        // ★ 必须优雅关闭，不能直接 drop：这条工作连接在 tcp_mux 下是 yamux 流，
+        //   drop 会以 RST 收场，对端尚未读走的 NatHoleSid 直接被内核丢弃 ——
+        //   官方 frpc 侧表现为 `xtcp read from workConn error: connection reset`，
+        //   随后既不回 NatHoleClient，visitor 5 秒 `context deadline exceeded`，
+        //   服务端 10 秒 `等待 provider 的 NatHoleClient 超时`，只能靠下一次重试
+        //   才打通（首次打洞要等 10 秒的观感就是这么来的）。
+        //   见 `common/src/frp/conn.rs` 里 `shutdown()` 的说明。
+        work_conn.shutdown().await.ok();
     });
 
     // 独立超时任务，只把错误投递回控制通道。

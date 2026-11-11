@@ -2984,6 +2984,9 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
                         let (e, _) = client.proxy_flags(&backend.proxy_name);
                         e.then(|| nfrp_common::frp::v1::derive_key(sec.auth_cfg.token.as_bytes()))
                     },
+                    // TCP 路径没有"访客"这一侧，第二个密钥用不到。
+                    visitor_key: None,
+                    visitor_compression: false,
                     remote_port,
                     stream: Box::pin(stream),
                     peer,
@@ -3579,15 +3582,43 @@ async fn handle_visitor(
     }
 
     let (stream, leftover) = conn.into_stream();
+
+    // ★★ v0.8.4 修（高危）：stcp / xtcp 的数据面加密是**逐跳**的，两侧密钥不同。
+    //
+    // ```text
+    // 访客 ⟷ frps ⟷ provider(frpc)
+    //        ↑         ↑
+    //   secretKey     token 派生
+    // ```
+    //
+    // 官方 frps 在两侧各解一次：
+    //   * `server/proxy/proxy.go`   → `WithEncryption(local, pxy.encryptionKey)`（token）
+    //   * `server/visitor/visitor.go` → `WithEncryption(rwc, []byte(l.sk))`（secretKey）
+    //
+    // 旧实现把两侧都写死成"不加密 / data_key: None"，理由是"加密由两端自己协商"，
+    // 但这个理解是错的：frps 不是密文透传，它必须各自解一次再各自加一次。
+    // 后果是 provider 加密的字节被原样交给访客 —— 实测 `Go frpc(useEncryption=true)`
+    // + `Rust frpc(visitor)` 表现为「visitor 接入成功、上行 47B、下行 0B」，
+    // RDP 的 X.224 握手永远等不到响应；把同一份配置的 useEncryption 关掉立刻就能通。
+    let (prov_enc, prov_comp) = entry.client.proxy_flags(&proxy_name);
+    let token = registry.security().auth_cfg.token.clone();
     let user = PendingUser {
         proxy: proxy_name.clone(),
         proxy_type: entry.proxy_type.clone(),
         client_user: entry.client.user.clone(),
         client_run_id: entry.client.run_id(),
-        // visitor 走的是 visitor 自己那条通道，加密/压缩由它自己协商
-        use_encryption: false,
-        use_compression: false,
-        data_key: None,
+        // work 侧（到 provider 的那条）：跟着**代理**的 transport 走，密钥用 token 派生。
+        use_encryption: prov_enc,
+        use_compression: prov_comp,
+        data_key: prov_enc.then(|| {
+            nfrp_common::frp::v1::derive_key(token.as_bytes())
+        }),
+        // visitor 侧（到访客的那条）：跟着**访客自己**在 NewVisitorConn 里声明的开关走，
+        // 密钥用 provider 的 secretKey 派生（与签名校验用的是同一个密钥）。
+        visitor_key: msg
+            .use_encryption
+            .then(|| nfrp_common::frp::v1::derive_key(entry.secret_key.as_bytes())),
+        visitor_compression: msg.use_compression,
         // visitor 没有公网端口概念
         remote_port: 0,
         stream: Box::pin(PrefixedStream::new(leftover, stream)),
@@ -3597,7 +3628,13 @@ async fn handle_visitor(
         queue_permit: None,
         load: None,
     };
-    info!(proxy = %proxy_name, kind = %entry.proxy_type, "visitor 接入成功，开始中继");
+    info!(
+        proxy = %proxy_name,
+        kind = %entry.proxy_type,
+        prov_enc,
+        visitor_enc = msg.use_encryption,
+        "visitor 接入成功，开始中继"
+    );
     spawn_bridge(user, work, registry.clone());
     Ok(())
 }
@@ -3733,6 +3770,8 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
         use_encryption: user_enc,
         use_compression: user_comp,
         data_key: user_key,
+        visitor_key,
+        visitor_compression,
         ..
     } = user;
     let mut work_conn = work.conn;
@@ -3770,24 +3809,56 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
         user_stream.write_all(&leftover).await?;
     }
     let mut work_stream: nfrp_common::frp::stream::BoxStream = if will_wrap {
-        Box::pin(nfrp_common::frp::stream::PrefixedStream::new(
-            leftover,
-            work_stream,
+        let raw: nfrp_common::frp::stream::BoxStream =
+            Box::pin(nfrp_common::frp::stream::PrefixedStream::new(
+                leftover,
+                work_stream,
+            ));
+        Box::pin(nfrp_common::frp::proxy_stream::ProxyStream::new(
+            raw,
+            user_key,
+            user_comp,
         ))
     } else {
         Box::pin(work_stream)
     };
 
+    // ★★ v0.8.4：**访客那一侧**同样要解/加密。
+    //
+    // 旧实现只包了 work 侧，注释写的是"用户连接保持明文"。那对
+    // provider 不加密、只靠 frps 解密的方向成立，但只要 provider 开了
+    // `useEncryption`，frps 就必须**两侧同时**处理 —— 它是一条
+    // 解密→再加密的中转，不是密文透传。
+    //
+    // 密钥与 work 侧不同：visitor 侧跟 provider 的 `secretKey` 走
+    // （官方 `server/visitor/visitor.go` 就是 `[]byte(l.sk)`）。
+    let wrap_visitor = visitor_key.is_some() || visitor_compression;
+    let mut user_stream: nfrp_common::frp::stream::BoxStream = if wrap_visitor {
+        Box::pin(nfrp_common::frp::proxy_stream::ProxyStream::new(
+            user_stream,
+            visitor_key,
+            visitor_compression,
+        ))
+    } else {
+        Box::pin(user_stream)
+    };
+
     // 无论成功、失败、还是上面某个 `?` 提前返回，`guard` 都会在作用域结束时
     // 归还计数 —— 这就是 RAII 修法的全部价值。
-    // ★ v0.6.6：数据面解密 / 解压（官方 transport.useEncryption / useCompression）
     //
-    // 与客户端对称：包在**工作连接**这一侧（work_stream = 到 frpc 的那条），
-    // 用户连接（user_stream）保持明文。
-    //
-    // 标志来自注册时记下的 NewProxy 字段。查不到就当没配（明文透传）——
-    // 绝不能“查不到就按密文解”，那会把正常流量解成垃圾。
-    let (enc, comp) = (user_enc, user_comp);
+    // 标志来自注册时记下的 NewProxy 字段（work 侧）与 NewVisitorConn（访客侧）。
+    // 查不到就当没配（明文透传）—— 绝不能“查不到就按密文解”，
+    // 那会把正常流量解成垃圾。
+    if will_wrap || wrap_visitor {
+        debug!(
+            proxy = %proxy,
+            work_enc = user_enc,
+            work_comp = user_comp,
+            visitor_enc = visitor_key.is_some(),
+            visitor_comp = visitor_compression,
+            "服务端数据面已启用解密/解压（两侧独立）"
+        );
+    }
     // NLink 限流：规则表为空时**完全走原来的路径**（零额外开销、零行为差异）。
     let nlink_rt = registry.nlink();
     let limiter = if nlink_rt.rate_limit_enabled() {
@@ -3795,32 +3866,11 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
     } else {
         None
     };
-    let relay_result = match (limiter, enc || comp) {
-        (None, true) => {
-            let key = user_key;
-            debug!(proxy = %proxy, enc, comp, "服务端数据面已启用解密/解压");
-            let mut wrapped =
-                nfrp_common::frp::proxy_stream::ProxyStream::new(work_stream, key, comp);
-            util::relay_between(&mut user_stream, &mut wrapped).await
-        }
-        (None, false) => util::relay_between(&mut user_stream, &mut work_stream).await,
-        (Some(lim), true) => {
-            let key = user_key;
-            debug!(proxy = %proxy, enc, comp, "服务端数据面已启用解密/解压（带限流）");
-            let mut wrapped =
-                nfrp_common::frp::proxy_stream::ProxyStream::new(work_stream, key, comp);
-            crate::nlink::relay_throttled(lim, &client_user, &proxy, &mut user_stream, &mut wrapped)
+    let relay_result = match limiter {
+        None => util::relay_between(&mut user_stream, &mut work_stream).await,
+        Some(lim) => {
+            crate::nlink::relay_throttled(lim, &client_user, &proxy, &mut user_stream, &mut work_stream)
                 .await
-        }
-        (Some(lim), false) => {
-            crate::nlink::relay_throttled(
-                lim,
-                &client_user,
-                &proxy,
-                &mut user_stream,
-                &mut work_stream,
-            )
-            .await
         }
     };
 
@@ -4019,6 +4069,8 @@ pub(crate) fn test_pending(proxy: &str, slot: Option<ConnSlot>) -> PendingUser {
         use_encryption: false,
         use_compression: false,
         data_key: None,
+        visitor_key: None,
+        visitor_compression: false,
         remote_port: 0,
         stream: Box::pin(tokio::io::empty()),
         peer: SocketAddr::from(([127, 0, 0, 1], 8080)),

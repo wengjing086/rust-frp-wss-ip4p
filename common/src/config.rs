@@ -1459,7 +1459,12 @@ impl ServerConfig {
     /// 走 [`parse_server_toml`]，因此**原版 frps 的配置文件可以直接用**。
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let raw = std::fs::read_to_string(path.as_ref()).map_err(crate::error::Error::Io)?;
-        parse_server_toml(&raw)
+        // ★ v0.8.5：这里原本直接调 `parse_server_toml`，于是老式 `frps.ini`
+        // 被当成 TOML 解析，第 2 行就报 `expected newline` 启动失败 ——
+        // 而 `frpc.ini` 一直是好的（`ClientConfig::load` 走的是 `parse_client`，
+        // 那条路径自带 INI 识别）。两端兼容层不一致，用户只会觉得"服务端坏了"。
+        // `parse_server` 才是带 TOML / INI 自动识别的正式入口。
+        parse_server(&raw)
     }
 
     /// 写入一份带注释的示例配置。
@@ -3352,10 +3357,25 @@ pub fn parse_client(raw: &str) -> Result<ClientConfig> {
 /// 解析服务端配置文本，自动识别 TOML / legacy INI。规则同 [`parse_client`]。
 pub fn parse_server(raw: &str) -> Result<ServerConfig> {
     if crate::frp_legacy::is_legacy_ini(raw) {
-        let value = crate::frp_legacy::legacy_server_to_value(raw)?;
+        let mut value = crate::frp_legacy::legacy_server_to_value(raw)?;
+        // 先取再 move —— `try_into()` 会吃掉 value。
+        let bind_addr_explicit = value.get("bind_addr").is_some();
+        // ★ v0.8.5：INI 转换出来的是**官方键名**（`bind_port` / `vhost_http_port`
+        // …），必须再过一遍与 TOML 相同的归一化，才能落到内部字段名
+        // （`control_port` / `work_port` …）。
+        //
+        // 漏掉这一步的后果比"读不了"更坏：`frps.ini` 能正常启动，但
+        // `bind_port = 7100` 被静默忽略、服务端跑在默认 7000 上 ——
+        // 用户改端口"不生效"，排查半天以为是端口被占。
+        crate::frp_config::normalize_server(&mut value);
         let mut cfg: ServerConfig = value.try_into()?;
         // INI 同样要扫**原文**（转换后的 value 里只剩认识的键）。
         cfg.unsupported_fields = crate::frp_config::unsupported_server_fields_ini(raw);
+        // ★ v0.8.5：INI 分支也要填这个"用户是否显式写过 bind_addr"的标记。
+        // TOML 分支由 `parse_server_toml` 填，这里若漏掉，`frps.ini` 用户写
+        // `bind_addr = 0.0.0.0` + 不配面板密码时就会**绕过**那道启动校验 ——
+        // 等于换一种配置格式就关掉了安全检查。
+        cfg.bind_addr_explicitly_set = bind_addr_explicit;
         return Ok(cfg);
     }
     parse_server_toml(raw)
@@ -4067,6 +4087,58 @@ pub fn parse_server_toml(raw: &str) -> Result<ServerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.8.5 回归：`ServerConfig::load` 必须能读老式 `frps.ini`。
+    ///
+    /// 修复前它直接调 `parse_server_toml`，于是 INI 文件在第 2 行就报
+    /// `TOML parse error: expected newline` 启动失败 —— 而同一份格式的
+    /// `frpc.ini` 一直是好的（`ClientConfig::load` 走 `parse_client`，自带
+    /// INI 识别）。两端不一致，用户只会以为"服务端坏了"。
+    #[test]
+    fn 服务端配置加载_老式_ini_也能读() {
+        let dir = std::env::temp_dir().join(format!("nfrp_ini_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("frps.ini");
+        std::fs::write(
+            &path,
+            "[common]\n\
+             bind_addr = 127.0.0.1\n\
+             bind_port = 7100\n\
+             token = legacy-token\n\
+             dashboard_port = 7500\n\
+             dashboard_user = admin\n\
+             dashboard_pwd = pw\n",
+        )
+        .unwrap();
+
+        let cfg = ServerConfig::load(&path).expect("老式 frps.ini 必须能加载");
+        assert_eq!(cfg.frp_bind_port(), 7100, "bind_port 要真正生效（不能静默退回 7000）");
+        assert_eq!(cfg.token, "legacy-token");
+        assert_eq!(cfg.dashboard_port, Some(7500));
+        assert_eq!(cfg.dashboard_user, "admin");
+        // 安全校验依赖这个标记：INI 里写了 bind_addr 就算"显式设置"。
+        assert!(
+            cfg.bind_addr_explicitly_set,
+            "INI 里写了 bind_addr，必须认出来（否则会绕过启动期的安全校验）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 对照组：没写 `bind_addr` 的 INI 不该被误判成"显式设置"。
+    #[test]
+    fn 服务端配置_ini_没写_bind_addr_不算显式() {
+        let dir = std::env::temp_dir().join(format!("nfrp_ini_test2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("frps2.ini");
+        std::fs::write(&path, "[common]\nbind_port = 7200\ntoken = t\n").unwrap();
+
+        let cfg = ServerConfig::load(&path).unwrap();
+        assert_eq!(cfg.frp_bind_port(), 7200);
+        assert!(!cfg.bind_addr_explicitly_set);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // -----------------------------------------------------------------------
     // Debug 脱敏（v0.5.3）

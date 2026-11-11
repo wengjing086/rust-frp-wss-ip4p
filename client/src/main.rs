@@ -1715,7 +1715,12 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
         None => (None, None),
     };
     if p2p_route.is_none() && cfg.proxies.iter().any(|p| p.proxy_type == "xtcp") {
-        warn!("有 xtcp 代理但未配置 p2p_port，xtcp 将退化为中继（与 stcp 相同）");
+        warn!(
+            "有 xtcp 代理但未配置 p2p_port，本端无法参与打洞。\
+             xtcp 的中继路径只有 nfrp-server 提供：对端若是**官方 frps**，\
+             xtcp 会直接失败（官方 frps 既没有 nfrp 的牵线端口，也不给 xtcp 做中继）——\
+             这种组合请改用 stcp，同样加密、只是数据走服务端转发"
+        );
     }
 
     // 把当前会话公布出去，visitor 从这里取连接与 run_id

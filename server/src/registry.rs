@@ -301,10 +301,25 @@ impl Registry {
         // 但被 kill / 断网时它根本发不出这条消息，只有这里能兜底 ——
         // 否则面板上的"生效代理"只增不减，跑几天全是水分。
         // 必须趁 `stop()` 清空名册**之前**取数，之后再取永远是 0。
-        let outstanding = c.proxy_names().len() as i64;
+        let names = c.proxy_names();
+        let outstanding = names.len() as i64;
+        let client_id = c.client_id().to_string();
         c.stop();
         if outstanding > 0 {
             self.metrics().proxies_active.add(-outstanding);
+        }
+        // ★ v0.8.5：把统计表里的这些代理标成离线。
+        //
+        // 之前只有 `CloseProxy` 那条路径调 `stats.mark_closed()`，而客户端
+        // 被强杀 / 断网时根本发不出这条消息 —— 于是 `open()` 置的 `online`
+        // 永远没人复位，面板上的代理一直显示在线，连"清理离线代理"都清不掉
+        // （它按 `online == false` 筛）。端口、域名、visitor 都在下面照旧
+        // 回收了，唯独显示状态成了僵尸。
+        //
+        // 用 `mark_closed_of` 而不是 `mark_closed`：重连场景下新会话可能刚
+        // 注册了同名代理，无条件置离线会把新的那条一起标掉。
+        for name in &names {
+            self.stats.mark_closed_of(name, &client_id);
         }
         // 客户端的 http/https 域名要一并回收，否则域名会一直被占着
         if let Some(t) = self.vhosts() {

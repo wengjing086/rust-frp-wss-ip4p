@@ -267,6 +267,27 @@ impl ProxyStats {
         }
     }
 
+    /// 客户端会话**整体回收**时调用：只标记仍归属该客户端的代理。
+    ///
+    /// # 为什么不能直接复用 [`mark_closed`]
+    ///
+    /// 客户端断线重连的时序是「新会话先登录并注册同名代理」→「旧会话的
+    /// 清理任务才被调度」。若按名字无条件置离线，旧会话的清理会把**新会话
+    /// 刚注册的**那条代理一起标成 offline，面板上"在线"与否就取决于两个
+    /// 任务谁先跑 —— 表现为随机闪烁，比不更新更难排查。
+    ///
+    /// 这里比对 `client_id`：同名的代理若已经换了主人，就跳过；
+    /// 同一台机器换配置重连（client_id 相同）时仍然正确置离线。
+    pub fn mark_closed_of(&self, name: &str, client_id: &str) {
+        if let Some(st) = self.get(name) {
+            if st.client_id == client_id {
+                st.set_online(false);
+                st.last_close
+                    .store(unix_now(), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn get(&self, name: &str) -> Option<std::sync::Arc<ProxyStat>> {
         self.map
             .read()
@@ -556,5 +577,60 @@ mod tests {
         t.mark_login("c1", "u", "r2", "0.8.1", "host", "windows", "amd64", "1.2.3.4");
         assert_eq!(t.online_count(), 1);
         assert_eq!(t.get("c1").unwrap().run_id, "r2");
+    }
+
+    /// v0.8.5 回归：客户端被强杀（发不出 `CloseProxy`）后，代理必须能被标离线。
+    ///
+    /// 修复前 `mark_closed` 在生产代码里**没有任何调用点**，`open()` 置的
+    /// `online=true` 永远没人复位 —— 面板上的代理一直是"在线"，
+    /// 连"清理离线代理"也清不掉（它按 `online == false` 筛）。
+    #[test]
+    fn mark_closed_of_按归属置离线() {
+        let s = ProxyStats::default();
+        s.open("p1", "tcp", "u", "client-a", serde_json::json!({}));
+        assert!(s.get("p1").unwrap().is_online());
+
+        s.mark_closed_of("p1", "client-a");
+        assert!(!s.get("p1").unwrap().is_online(), "归属匹配时必须置离线");
+        assert!(
+            s.get("p1").unwrap().last_close() > 0,
+            "关闭时间要写下来，面板靠它显示最后离线时刻"
+        );
+    }
+
+    /// 重连时序：新会话已经注册了同名代理，旧会话的清理**不能**把它标离线。
+    ///
+    /// 否则"在线与否"取决于两个清理任务谁先跑，面板随机闪烁。
+    #[test]
+    fn mark_closed_of_不误伤新会话的同名代理() {
+        let s = ProxyStats::default();
+        s.open("p1", "tcp", "u", "client-old", serde_json::json!({}));
+        // 新会话（同一台机器重连，client_id 换了）抢到同名代理。
+        s.open("p1", "tcp", "u", "client-new", serde_json::json!({}));
+
+        s.mark_closed_of("p1", "client-old");
+        assert!(
+            s.get("p1").unwrap().is_online(),
+            "旧会话的清理不该把新会话刚注册的代理标离线"
+        );
+
+        s.mark_closed_of("p1", "client-new");
+        assert!(!s.get("p1").unwrap().is_online(), "真正的主人下线才置离线");
+    }
+
+    /// 重连后历史流量与连接计数要保住（`open` 的既有语义，顺带锁住）。
+    #[test]
+    fn 离线后再上线_流量不清零() {
+        let s = ProxyStats::default();
+        s.open("p1", "tcp", "u", "c1", serde_json::json!({}));
+        s.add_traffic("p1", 100, 200);
+        s.mark_closed_of("p1", "c1");
+        assert!(!s.get("p1").unwrap().is_online());
+
+        s.open("p1", "tcp", "u", "c1", serde_json::json!({}));
+        let st = s.get("p1").unwrap();
+        assert!(st.is_online(), "重新注册要恢复在线");
+        let (tin, tout) = st.today_in_out();
+        assert_eq!((tin, tout), (100, 200), "重连不该清零历史流量");
     }
 }

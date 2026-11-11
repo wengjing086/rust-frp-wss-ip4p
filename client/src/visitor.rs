@@ -370,6 +370,16 @@ async fn handle_user(
                 reason = reason.as_str(),
                 "按策略走中继"
             );
+            if cfg.visitor_type == "xtcp" && session.p2p.is_none() {
+                // 官方 frps 没有 xtcp 中继：这里再往下走一定会被对端重置，
+                // 提前说清楚比让用户对着 `connection reset` 猜要好。
+                warn!(
+                    visitor = %cfg.name,
+                    "xtcp 没有可用的 P2P 通道（未配置 p2p_port，或服务端不提供牵线），\
+                     只能走中继；而**官方 frps 不提供 xtcp 中继** —— \
+                     对端是官方 frps 时请改用 stcp（同样加密，只是数据经服务端转发）"
+                );
+            }
         }
     }
 
