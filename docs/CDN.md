@@ -89,6 +89,77 @@ CDN 找不到对应站点。所以客户端必须显式给 `transport.tls.server
 websocket.host  →  tls.serverName  →  serverAddr
 ```
 
+### 2.4 只有 WebSocket 能过 CDN：`quic` / `kcp` 为什么不行
+
+这一节把三个**互相独立**的概念分开，混在一起是配置失败的头号原因：
+
+| 层 | 配置项 | 取值 | 它决定什么 |
+|---|---|---|---|
+| **传输层** | `transport.protocol` | `tcp` / `tls` / `websocket` / `wss` / `quic` / `kcp` | 客户端 ↔ frps 那条长连接怎么走 |
+| **代理类型** | `[[proxies]].type` | `tcp` / `udp` / `http` / `https` / `stcp` / `sudp` / `xtcp` | 被代理的**应用**是 TCP 还是 UDP |
+| **网络路径** | （部署方式） | 直连 / CDN | 中间隔不隔一层 CDN |
+
+**结论：`quic` 和 `kcp` 无法经过 CDN，这不是"会更慢"，而是根本连不上。**
+
+原因在端口层面，两条都绕不过去：
+
+1. **CDN 回源只打 TCP 80 / 443**，只认 HTTP 请求和 WebSocket 升级。
+   CDN 不做通用的 UDP 转发 —— 它没法为一条任意 UDP 会话做路由、鉴权和计费。
+2. **frps 的 QUIC 监听在独立的 UDP 端口上**。看 `server/src/serve.rs:724`：
+
+   ```rust
+   let quic_port = cfg.quic_bind_port.or_else(|| {
+       if is_quic(&cfg.transport_protocol) { Some(addr.port()) } else { None }
+   });
+   ```
+
+   也就是说它要么在 `quicBindPort` 那个 UDP 端口，要么在 `bindPort/udp`。
+   你让 CDN 回源到 `bindPort` 的 TCP，QUIC 的握手包**一个字节都到不了 frps**。
+
+所以把 `transport.protocol` 改成 `quic` 再去掉 CDN，或者保留 CDN 用 `wss`，只能二选一。
+
+#### `sudp` 不是"传输层用 UDP"
+
+`sudp`（Secret UDP）的「UDP」指的是**被代理的应用数据是 UDP** —— 比如自建 DNS、
+游戏服、WireGuard。它和 `stcp` 共用同一套 `secretKey` / `allowUsers` 鉴权，
+区别只在数据面是报文而不是字节流。
+
+**它的传输层照样可以是 `wss`，因此 `sudp` 能过 CDN。** 别把 `sudp` 和 `quic` 当成一回事：
+
+```toml
+# 完全合法：UDP 应用数据被封装进 WSS 流，能穿 CDN
+transport.protocol = "wss"
+
+[[proxies]]
+name = "dns"
+type = "sudp"
+localIP = "127.0.0.1"
+localPort = 53
+secretKey = "xxx"
+```
+
+反过来说，`sudp` 帮不了远程桌面：RDP 的主连接是 **TCP**（该用 `stcp`），
+它的 UDP 3391 是协商出来的辅助通道，`sudp` 的静态端口转发对不上。
+
+#### 那 `quic` / `kcp` 什么时候值得用
+
+它们解决的是**丢包与抖动**，不是带宽不足。判断标准很直接：
+
+| 你的问题 | 该做什么 |
+|---|---|
+| 带宽被打满（上行跑满、画面糊） | 留下来用 `wss`，去压缩画面数据 —— 换 UDP 只会更糟 |
+| 带宽够但丢包高、卡顿有节奏 | 可以试 `quic`（**必须直连，不能过 CDN**） |
+| 延迟高但稳定（跨运营商长途） | UDP 帮不上，只能换线路或就近部署 |
+
+`kcp` 尤其要注意：它的默认配置就是**用冗余换延迟**。`common/src/frp/kcp.rs:295`
+的注释写得很清楚 ——
+
+> 弱网模式：关掉延迟 ACK / 拥塞退让，让重传尽可能激进。
+
+实际调用是 `set_nodelay(true, 10, 5)`（10 ms 一轮 flush、丢 5 个包即快速重传，
+最小 RTO 从 100 ms 压到 30 ms），并且**完全不做拥塞退让**。丢包时同一份数据会被
+重传多次，**总发送量明显高于 TCP**。带宽本来就紧张的话，换 KCP 是雪上加霜。
+
 ---
 
 ## 3. 原理：本项目 frps 的「两级嗅探」

@@ -100,6 +100,11 @@ tls_custom_first_byte = true
 # websocket / wss 由服务端按连接内容自动识别，服务端无需额外配置。
 # 选了 quic 之后 TLS / yamux 两层会被自动跳过（QUIC 自带加密与多路复用，
 # 每条双向流就是一条 frp 连接）。需要防火墙放行 UDP。
+#
+# ★ quic / kcp **无法经过 CDN / WAF**：它们跑在独立 UDP 端口上，而 CDN 回源
+#   只打 TCP 80/443。要用 CDN 就必须留在 websocket / wss，别改这一行。
+#   （`sudp` 是另一回事 —— 那是"应用数据是 UDP"，不是"传输层用 UDP"，
+#     它的传输层照样可以配 wss，因此能过 CDN。）
 transport_protocol = "tcp"
 
 # ---- xtcp 真 P2P：填上服务端的 p2p_port 才会尝试打洞 ----
