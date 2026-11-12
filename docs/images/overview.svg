@@ -1,22 +1,64 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="800" height="250" viewBox="0 0 800 250" role="img">
-<title>frps 与 frpc 整体拓扑</title>
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400" viewBox="0 0 800 400" role="img">
+<title>整体拓扑 · 内网到公网的一条隧道</title>
 <defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M2 1L8 5L2 9" fill="none" stroke="#57606a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
-<rect x="0" y="0" width="800" height="250" rx="12" fill="#ffffff"/>
-<rect x="20" y="45" width="225" height="84" rx="10" fill="#f6f8fa" stroke="#185FA5" stroke-width="1.5"/>
-<rect x="20" y="45" width="5" height="84" rx="2" fill="#185FA5"/>
-<text x="132" y="78.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="600" fill="#1f2328">内网 frpc</text>
-<text x="132" y="101.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">RDP / SSH / Web</text>
-<rect x="288" y="45" width="225" height="84" rx="10" fill="#f6f8fa" stroke="#185FA5" stroke-width="1.5" stroke-dasharray="5 4"/>
-<rect x="288" y="45" width="5" height="84" rx="2" fill="#185FA5"/>
-<text x="400" y="78.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="600" fill="#1f2328">可选：CDN / WAF</text>
-<text x="400" y="101.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">IP4P 覆盖拨号目标</text>
-<rect x="556" y="45" width="225" height="84" rx="10" fill="#f6f8fa" stroke="#0F6E56" stroke-width="1.5"/>
-<rect x="556" y="45" width="5" height="84" rx="2" fill="#0F6E56"/>
-<text x="668" y="78.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="600" fill="#1f2328">frps 同端口 7000</text>
-<text x="668" y="101.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">TCP / TLS / WS / WSS</text>
-<path d="M248 87 L284 87" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
-<path d="M516 87 L552 87" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
-<text x="400" y="170" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">外部访问者通过 remotePort 或 stcp 接入；隧道内字节原样往返</text>
-<text x="400" y="200" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">WSS、IP4P、CDN 适配均无需修改 frps.toml</text>
+<rect x="0" y="0" width="800" height="400" rx="12" fill="#ffffff" stroke="#ffffff" stroke-width="0"/>
+<text x="20" y="27" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328">整体拓扑 · 内网到公网的一条隧道</text>
+<text x="780" y="27" text-anchor="end" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">frp v0.71.0 线协议 · 配置零改动</text>
+<path d="M20 39 L780 39" stroke="#d8dee4" stroke-width="1" fill="none"/>
+<rect x="16" y="50" width="210" height="230" rx="12" fill="#eef5fc" stroke="#c9dcf0" stroke-width="1.2"/>
+<rect x="272" y="50" width="210" height="230" rx="12" fill="#f7f8fa" stroke="#d0d7de" stroke-width="1.2" stroke-dasharray="5 4"/>
+<rect x="528" y="50" width="256" height="230" rx="12" fill="#e8f5f0" stroke="#b8ddd0" stroke-width="1.2"/>
+<text x="28" y="72" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="12" font-weight="600" fill="#185FA5">内网 / 家宽</text>
+<text x="284" y="72" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="12" font-weight="600" fill="#57606a">公网链路（可选）</text>
+<text x="540" y="72" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="12" font-weight="600" fill="#0F6E56">公网服务器</text>
+<rect x="28" y="84" width="186" height="62" rx="9" fill="#ffffff" stroke="#185FA5" stroke-width="1.3"/>
+<rect x="28" y="84" width="4" height="62" rx="2" fill="#185FA5"/>
+<text x="121.0" y="108.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328">业务服务</text>
+<text x="121.0" y="129.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">RDP 3389 · SSH 22 · Web 80</text>
+<path d="M121 146 L121 165" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
+<rect x="28" y="168" width="186" height="62" rx="9" fill="#ffffff" stroke="#185FA5" stroke-width="1.3"/>
+<rect x="28" y="168" width="4" height="62" rx="2" fill="#185FA5"/>
+<text x="121.0" y="192.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328">frpc</text>
+<text x="121.0" y="213.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">官方 frpc 或本项目 frpc</text>
+<rect x="28" y="242" width="78" height="22" rx="11" fill="#185FA5" stroke="#185FA5" stroke-width="0.6"/>
+<text x="67.0" y="257" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11" font-weight="600" fill="#ffffff">无公网 IP</text>
+<rect x="284" y="84" width="186" height="62" rx="9" fill="#ffffff" stroke="#57606a" stroke-width="1.3" stroke-dasharray="5 4"/>
+<rect x="284" y="84" width="4" height="62" rx="2" fill="#57606a"/>
+<text x="377.0" y="108.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328">CDN / WAF</text>
+<text x="377.0" y="129.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">路径 /ws 可自定义</text>
+<rect x="284" y="168" width="186" height="62" rx="9" fill="#ffffff" stroke="#57606a" stroke-width="1.3"/>
+<rect x="284" y="168" width="4" height="62" rx="2" fill="#57606a"/>
+<text x="377.0" y="192.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328">IP4P 解析</text>
+<text x="377.0" y="213.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">TXT / AAAA → IP:端口</text>
+<rect x="284" y="242" width="78" height="22" rx="11" fill="#57606a" stroke="#57606a" stroke-width="0.6"/>
+<text x="323.0" y="257" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11" font-weight="600" fill="#ffffff">可跳过</text>
+<rect x="540" y="84" width="232" height="62" rx="9" fill="#ffffff" stroke="#0F6E56" stroke-width="1.3"/>
+<rect x="540" y="84" width="4" height="62" rx="2" fill="#0F6E56"/>
+<text x="656.0" y="108.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328">frps · bindPort 7000</text>
+<text x="656.0" y="129.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">同端口自动识别四种协议</text>
+<rect x="540" y="154" width="52" height="22" rx="11" fill="#185FA5" stroke="#185FA5" stroke-width="0.6"/>
+<text x="566.0" y="169" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11" font-weight="600" fill="#ffffff">TCP</text>
+<rect x="598" y="154" width="52" height="22" rx="11" fill="#185FA5" stroke="#185FA5" stroke-width="0.6"/>
+<text x="624.0" y="169" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11" font-weight="600" fill="#ffffff">TLS</text>
+<rect x="656" y="154" width="52" height="22" rx="11" fill="#0F6E56" stroke="#0F6E56" stroke-width="0.6"/>
+<text x="682.0" y="169" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11" font-weight="600" fill="#ffffff">WS</text>
+<rect x="714" y="154" width="52" height="22" rx="11" fill="#0F6E56" stroke="#0F6E56" stroke-width="0.6"/>
+<text x="740.0" y="169" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11" font-weight="600" fill="#ffffff">WSS</text>
+<rect x="540" y="188" width="232" height="62" rx="9" fill="#ffffff" stroke="#0F6E56" stroke-width="1.3"/>
+<rect x="540" y="188" width="4" height="62" rx="2" fill="#0F6E56"/>
+<text x="656.0" y="212.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328">控制面 + 内嵌面板</text>
+<text x="656.0" y="233.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">yamux · 流量 · 真实 IP 归属地</text>
+<path d="M214 115 L282 115" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
+<path d="M470 115 L538 115" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
+<path d="M121 230 L121 298 L656 298 L656 252" fill="none" stroke="#57606a" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+<text x="388" y="286" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11" font-weight="400" fill="#57606a">也可跳过 CDN 直连</text>
+<rect x="16" y="310" width="768" height="44" rx="9" fill="#fff7e8" stroke="#e8c98a" stroke-width="1.1"/>
+<text x="400.0" y="336.0" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="12" font-weight="500" fill="#1f2328">外部访问者 · remotePort / stcp visitor   ←→   隧道内字节原样往返</text>
+<rect x="20" y="374" width="16" height="3" rx="1.5" fill="#185FA5"/>
+<text x="44" y="379" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="10.5" font-weight="400" fill="#57606a">必经路径</text>
+<rect x="120" y="374" width="16" height="3" rx="1.5" fill="#57606a" stroke-dasharray="3 2"/>
+<text x="144" y="379" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="10.5" font-weight="400" fill="#57606a">可选 / 直连</text>
+<rect x="240" y="374" width="16" height="3" rx="1.5" fill="#0F6E56"/>
+<text x="264" y="379" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="10.5" font-weight="400" fill="#57606a">服务端增强（WSS 无需 nginx）</text>
 </svg>
