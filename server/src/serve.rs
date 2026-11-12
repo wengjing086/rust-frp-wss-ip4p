@@ -862,6 +862,22 @@ pub async fn serve_on_with(
                 }
                 let cfg = cfg.clone();
                 let registry = registry.clone();
+                // 关 Nagle（TCP_NODELAY）。
+                //
+                // Go 的 `net.TCPConn` 在 `newTCPConn` 里**默认就 `SetNoDelay(true)`**，
+                // 所以官方 frps 从来不需要显式写；而 tokio 沿用内核默认（Linux 上
+                // Nagle 是**开**的），不补这一行就与官方行为不一致。
+                //
+                // 影响面正好是交互式流量：这条连接是 frps → frpc 的**发送端**，
+                // stcp / xtcp 中继时 RDP 的输入事件（鼠标移动、按键，几个字节）、
+                // 控制消息、以及 SSH 的击键响应都从这里出去。Nagle 会把这类
+                // 小于 MSS 的包攒着等 ACK，再叠加 Windows 对端的延迟确认
+                // （默认 200 ms），最坏情况是**每个小包都被拖上几十到两百毫秒**。
+                // 表现就是"画面还行，但打字一顿一顿、鼠标发飘"。
+                //
+                // 代价只是小包不再合并（数量略增、总量几乎不变），
+                // 对交互式流量是必须的；大流量的画面数据本就是满 MSS，不受影响。
+                stream.set_nodelay(true).ok();
                 tokio::spawn(async move {
                     if let Err(e) = handle_conn(stream, peer, cfg, registry).await {
                         // ★★ v0.5.8 修（第七轮审计 **A-1**，中危）：**限流这条 WARN**。
