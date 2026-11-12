@@ -1,91 +1,32 @@
-## v0.8.7 — 默认资源上限、密钥派生缓存、发布链路可信度整理
+## v0.8.7 — 默认资源上限、密钥派生缓存、发布链路整理
 
-这一版**没有改线协议**，也没有引入新的互通能力；重点是把「跑起来没问题、
-但部署到公网长期不够稳 / 对外承诺对不上」的几处收掉。0.8.6 与 0.8.7 可以混用，
-frpc 不是必须升级（本版所有服务端行为变化都向后兼容）。
+**线协议没变，0.8.6 / 0.8.7 可以混用，frpc 不必升级。**
 
-### 修复与加固
+### 需要留意的行为变化
 
-**1. 三条转发闸门默认从「不限」改成保守上限。**
-`max_total_conns` / `max_conns_per_client` / `max_pending_per_client` 以前默认
-`0 = 不限`，而 `server/src/limits.rs` 的模块注释自己写明这是防 OOM 用的 ——
-预认证握手有 `PREAUTH_MAX = 2048` 闸门，认证后的转发连接却完全没有上限。
-现在默认 `5000 / 200 / 64`（就是示例配置里一直推荐的那组值），**显式写 `0`
-仍能恢复旧的「不限」行为**。
+三道转发连接上限默认从 `0（不限）` 改为 `5000 / 200 / 64`
+（`max_total_conns` / `max_conns_per_client` / `max_pending_per_client`）。
+以前认证通过的客户端不停建连就能把 task 数推到 OOM。客户端特别多时按容量调大，
+想恢复旧行为把三项显式写成 `0`。配置文件不写这三项即生效。
 
-这里有个容易漏的坑：结构体没有容器级 `#[serde(default)]`，只改 `impl Default`
-会导致「代码里 new 出来的配置有限流、读 TOML 解析出来的没有」。所以同时给三个字段
-指定了 `#[serde(default = "...")]` 函数，并加了回归测试把两条路径钉在一起。
+### 其它改动
 
-**2. 每条连接不再重算 64 轮 HMAC-SHA1。**
-`derive_key(token)` 是官方向量的纯派生函数，token 是进程级常量，但控制通道、
-每条加密隧道、stcp 双侧都按连接调用一次。新增 `derive_key_cached()` 按 token
-内容缓存（**不能用单值 `OnceLock`**：stcp visitor 侧用的是每个代理各自的
-`secretKey`，串值会变成「连得上但数据全乱」），运行时调用点全部切过去；
-纯函数保留，官方向量测试继续测它。另把 `PendingUser` 构造里对同一代理名的
-3 次 `proxy_flags()` 查询合并成 1 次。跨实现加密用例（`compat_go.py` 阶段 D）
-全部通过，确认缓存没有串密钥。
+- 密钥派生按 token 缓存（原来每条连接重算 64 轮 HMAC-SHA1），并合并重复的
+  `proxy_flags()` 查询；官方向量测试保留，跨实现加密用例全通。
+- 修掉一个偶发失败的单测竞态（全局打洞表被另一个测试清空）。
+- 统一启动期关于 timestamp 新鲜性窗口的过时告警文案。
+- 发布说明与脚本移入版本控制、去掉硬编码路径与 TAG，必选产物缺失不再静默跳过，
+  `SHA256SUMS.txt` 按实际产物自动生成；下载表不再列未构建的 Windows ARM64。
+- README 补「生产部署建议配置」与集中的已知限制表；误报申诉材料改为引用
+  仓库里确实存在的构建配置。
+- CI 配置随源码入库在 `ci/`；因 PAT 缺 `workflow` scope，GitHub Actions
+  **尚未启用**，启用步骤见 `ci/README.md`。
 
-**3. 修掉一个偶发失败的单测竞态。**
-`nathole_official::nat_report_成功会回写分数` 会偶发挂掉，原注释归因为
-「撞 session 名」。实际根因是另一个测试调用 `configure_analysis_reserve(0)`，
-它会**清空整张全局 `hole_records` 表**，唯一 sid 挡不住全表清空。现在所有读写该表的
-测试统一用已有的 `test_lock` 串行，不再互相踩。
+### 回归与升级
 
-**4. 启动期告警文案自相矛盾。**
-`server/src/main.rs` 里一处写着「服务端不校验时间戳新鲜性」，同文件另一处又写着
-「v0.5.7 已更正，全部 6 个凭证入口都加了 ±300 秒窗口」。现在统一成
-「窗口已收窄到 5 分钟，但窗口内抓到一条 Login 仍可离线枚举 token」——
-结论不变（弱 token 依然要告警），但不再误导运维判断重放面。
-
-### 工程化与发布链路
-
-- **CI 配置整理**：`ci/ci.yml` 在 push / PR 跑 `fmt --check` /
-  `clippy -D warnings` / `cargo test --workspace` 与三平台 release 构建；
-  smoke 里以前写 `|| true`（构建出跑不起来的二进制也会变绿），已去掉。
-  ⚠️ 当前使用的 PAT 只有 `repo` 权限、**没有 `workflow` scope**，GitHub 会拒绝
-  任何对 `.github/workflows/` 的写入（API 也返回 404），所以这两个 workflow
-  **尚未在 GitHub 上启用**。同内容配置以模板形式随源码入库在 `ci/` 下，
-  启用步骤见 `ci/README.md`：给 PAT 勾 `workflow` 后推送，或在网页端新建文件。
-- **统一发布契约**：`ci/release.yml` 原来打 3 平台压缩包并自动上传 Release，
-  与 `dist/` 交付的「4 平台独立可执行文件 + SHA256SUMS」是两套。现在
-  `release.yml` 改为**可复现性校验构建**，只产出同名独立文件与哈希、上传为
-  Actions artifacts，**不写 Release**；正式资产仍由 `scripts/build_all.sh`
-  本地交叉编译（gnu 版本资源 / musl 静态链接）后上传，避免同名资产互相覆盖。
-- **发布脚本进版本控制**：`RELEASE_NOTES.md`、`make_release.py`、
-  `upload_assets.py` 原先都在被整目录忽略的 `dist/` 下（`dist/keys/` 有签名私钥，
-  不做否定放行），别人拿到源码根本无法复现发布。现移到 `docs/` 与 `scripts/`。
-- **脚本去硬编码**：TAG 从 `Cargo.toml` 推导（`upload_assets.py` 原先停在
-  `v0.8.0`）；token 优先读 `GITHUB_TOKEN` / `GH_TOKEN` 环境变量；
-  工具链路径可由 `TOOLS_DIR` 覆盖；`build_all.sh` 改 `set -euo pipefail`，
-  必选平台构建失败不再「跳过」后拿旧产物发版；`SHA256SUMS.txt` 按实际存在的
-  产物自动生成。
-- **下载表不再承诺不存在的文件**：Windows ARM64 需 clang + gnullvm，
-  当前环境缺 clang，v0.8.6 / v0.8.7 都没这个产物，文档与 `SHA256SUMS.txt`
-  现在一致。README / `docs/ANTIVIRUS.md` 里「全部二进制由 GitHub Actions 构建」
-  的说法也已改成与事实相符的表述（此前误报申诉模板还引用了一个仓库里
-  根本不存在的 `.github/workflows/release.yml`）。
-- **README 新增「生产部署建议配置」**：三道限流的默认值与 `0 = 不限` 语义、
-  `udpPacketSize` 默认 `65507` 与官方 `1500` 的差异、TLS 默认
-  `InsecureSkipVerify = true`（只防窃听、不防主动 MITM）及其显式开启方式；
-  并把散落在源码注释里的已知限制（macOS 无 TUN、legacy INI 不支持 tcpmux、
-  OIDC 302、KCP / wss / xtcp 跨实现等）集中成一节。
-
-### 回归
-
-- 单测 **1070 项全过**（新增 3 项：缓存派生一致性与按 token 隔离、
-  TOML 默认值与 `impl Default` 一致、显式 `0` 恢复不限）
-- `cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 干净
-- 真实二进制 e2e：内部 `e2e_all.py` 42/42、跨官方 Go frp `compat_go.py`
-  **45/45 通过 + 7 项已知不支持**、阶段 5 生命周期 5/5、阶段 6 配置兼容 10/10、
-  踢客户端回归通过
-- 8 MiB 单条与 3×4 MiB 并发 wss 大流量全通；stcp 跨版本四种组合含 8 MiB 全通
-
-### 升级说明
-
-服务端单独升级即可拿到全部改动，旧版 frpc（含 0.8.5 / 0.8.6 与官方 Go frpc）
-连新版 frps 正常工作。唯一需要留意的行为变化是三道连接上限：客户端特别多或
-单客户端并发很高时按容量调大，想完全恢复旧行为就把三项显式写成 `0`。
+单测 1070 全过，`fmt --check` / `clippy -D warnings` 干净；真实二进制 e2e
+（含 Rust ↔ 官方 Go frp 45 项、8 MiB 与 3×4 MiB 并发 wss）全绿。
+服务端单独升级即可。
 
 ---
 
@@ -392,21 +333,15 @@ vhost）全部挂上按代理记账：今日上下行流量、当前连接数、
 
 ---
 
-## 下载（独立可执行文件，不打包）
+## 下载
 
-| 平台 | 服务端 | 客户端 |
-|---|---|---|
-| Windows x86_64 | `frps_windows_amd64.exe` | `frpc_windows_amd64.exe` |
-| Linux x86_64（静态 musl） | `frps_linux_amd64` | `frpc_linux_amd64` |
-| Linux ARM64（静态 musl） | `frps_linux_arm64` | `frpc_linux_arm64` |
-| Windows ARM64 | **本版暂不提供** | **本版暂不提供** |
+每个 Release 附**独立可执行文件**（不打包）与 `SHA256SUMS.txt`。校验值由
+`scripts/make_release.py` 按 `dist/` 中真实存在的产物自动生成 —— 请以对应版本
+`SHA256SUMS.txt` 实际列出的文件为准，不要照抄任何静态表格。
 
-Windows ARM64 需要 clang + `aarch64-pc-windows-gnullvm` 交叉工具链，当前构建环境
-缺 clang，v0.8.6 / v0.8.7 都没有这个平台的产物；补齐时会在对应版本说明里写明。
-请以 `SHA256SUMS.txt` 里**实际列出**的文件为准 —— 校验值由
-`scripts/make_release.py` 按 `dist/` 中真实存在的产物自动生成，不手工维护。
-
-Linux 版静态链接，不依赖 glibc：
+常规交付平台：Windows x86_64、Linux x86_64 / ARM64（静态 musl，不依赖 glibc）。
+Windows ARM64 需要 clang + `aarch64-pc-windows-gnullvm` 交叉工具链，缺工具链的
+版本不提供该平台。
 
 ```bash
 chmod +x frps_linux_amd64 frpc_linux_amd64

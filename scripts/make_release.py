@@ -21,6 +21,7 @@
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -101,6 +102,39 @@ def req(method, url, data=None, content_type="application/json", raw=False):
             return e.code, {"raw": txt}
 
 
+def release_body(notes_text, tag):
+    """只取 changelog 里属于本 tag 的那一段作为 Release 正文。
+
+    以前直接把整份 `docs/RELEASE_NOTES.md` 塞进 body，结果是**每个 Release
+    都重复携带此前所有版本的说明**（v0.8.7 页面 12.8k 字符里只有开头的
+    一部分是当前版本），而且文件末尾那张描述「当前产物」的下载表也被复制
+    进了历史 Release，出现「v0.8.2 页面在讲 v0.8.7 缺 Windows ARM64」这种错位。
+    历史 changelog 仍完整留在 docs/ 里，body 只放本版 + 一个指回仓库的链接。
+    """
+    ver = tag.lstrip("v")
+    lines = notes_text.splitlines()
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith("## v" + ver)), None
+    )
+    if start is None:
+        raise SystemExit(
+            "RELEASE_NOTES.md 里找不到 %s 段落，拒绝发布空/全文 body" % tag
+        )
+    end = next(
+        (j for j in range(start + 1, len(lines)) if lines[j].startswith("## ")),
+        len(lines),
+    )
+    body = "\n".join(lines[start:end]).strip()
+    body = re.sub(r"\n+---\s*$", "", body)  # 去掉段落末尾的分隔线
+    # 链接固定指 main：changelog 是累积文档，tag 里那份是发布当时的快照，
+    # 可能还没经过后续修订；main 上才是最新且完整的版本。
+    body += (
+        "\n\n---\n\n下载见本 Release 资产与 `SHA256SUMS.txt`；完整更新日志："
+        "https://github.com/%s/%s/blob/main/docs/RELEASE_NOTES.md" % (OWNER, REPO)
+    )
+    return body
+
+
 def collect_assets():
     missing = [n for n in REQUIRED if not (DIST / n).is_file()]
     if missing:
@@ -133,6 +167,9 @@ def main(argv):
         print("离线校验产物（不联网）")
         present, _ = collect_assets()
         write_checksums(present)
+        tag = "v" + cargo_version()
+        body = release_body(NOTES.read_text(encoding="utf-8"), tag)
+        print("  %s 正文 = %d 字符（仅本版本段落）" % (tag, len(body)))
         return 0
 
     tag = argv[0] if argv else "v" + cargo_version()
@@ -148,11 +185,21 @@ def main(argv):
     write_checksums(present)
 
     TOKEN = get_token()
-    notes = NOTES.read_text(encoding="utf-8")
+    body = release_body(NOTES.read_text(encoding="utf-8"), tag)
+    print("   Release 正文 = %d 字符（仅 %s 段落）" % (len(body), tag))
 
     status, rel = req("GET", "%s/repos/%s/%s/releases/tags/%s" % (API, OWNER, REPO, tag))
     if status == 200:
         print("2) 已存在 Release:", rel.get("html_url"))
+        # 幂等重跑时把正文同步成最新 changelog（修正过长的旧 body 也靠这一步）
+        st, res = req(
+            "PATCH",
+            "%s/repos/%s/%s/releases/%d" % (API, OWNER, REPO, rel["id"]),
+            {"body": body},
+        )
+        print("   正文已同步:", "OK" if st == 200 else "失败 %s %s" % (st, res))
+        if st != 200:
+            return 1
     else:
         status, rel = req(
             "POST",
@@ -160,7 +207,7 @@ def main(argv):
             {
                 "tag_name": tag,
                 "name": name,
-                "body": notes,
+                "body": body,
                 "draft": False,
                 "prerelease": False,
             },
