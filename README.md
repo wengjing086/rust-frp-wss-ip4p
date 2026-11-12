@@ -193,6 +193,132 @@ trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12"]   # CDN 回源网段
 
 ---
 
+## 配置模板
+
+下面两份**复制即用**；每个功能模块的成对模板见 [docs/CONFIG.md](docs/CONFIG.md)，
+带全部注释的字段清单见 [assets/frps.toml](assets/frps.toml) / [assets/frpc.toml](assets/frpc.toml)
+（也可 `frps --gen-config frps.toml` 在命令行生成）。
+
+> **键名约定**：顶层与常用代理字段用官方 frp 0.71 的 camelCase 写法
+> （官方 frpc / frps 的配置可以原样喂进来）；NFrp 扩展字段（限流、健康检查、
+> 插件、指标等）没有 camelCase 别名，用 snake_case 平铺，两种写法可混用。
+
+### 最小可用
+
+**frps.toml**
+
+```toml
+bindAddr = "0.0.0.0"
+bindPort = 7000
+
+[auth]
+method = "token"
+token = "换成一个至少 16 位的随机强令牌"
+```
+
+**frpc.toml**
+
+```toml
+serverAddr = "你的服务端 IP 或域名"
+serverPort = 7000
+
+[auth]
+method = "token"
+token = "与服务端完全一致"
+
+[[proxies]]
+name = "ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 6022
+```
+
+> 生产环境请再加 `allowPorts` 端口白名单与强 token；`bindAddr` 只给内网用时改成回环地址。
+
+### 按功能模块速查
+
+| 功能模块 | frps 关键配置 | frpc 关键配置 | CONFIG.md |
+|---|---|---|---|
+| 基础连通 | `bindAddr` / `bindPort` / `[auth]` | `serverAddr` / `serverPort` / `[[proxies]]` | §1 |
+| 8 种代理类型 | `vhostHTTPPort` / `vhostHTTPSPort` / `tcpmuxHTTPConnectPort` / `p2p_port` | `[[proxies]]` 的 `type` | §2 |
+| stcp / xtcp 访客端 | 无需额外配置 | `[[visitors]]` + `user` + `secretKey` | §3 |
+| 6 种传输层 | `[transport] protocol` / `quicBindPort` / `kcpBindPort` | `[transport] protocol` / `[transport.tls]` | §4 |
+| 认证（token / OIDC / tokenSource） | `[auth]` | `[auth]` | §5 |
+| 数据面加密与压缩 | 无需配置（自动逐跳） | `[transport] useEncryption` / `useCompression` | §6 |
+| 面板、指标、本地管理 | `[webServer]` + `enablePrometheus` | `[webServer]` / `[store]` | §7 |
+| 端口白名单与资源上限 | `allowPorts` / `max_total_conns` / `[acl]` / `[[roles]]` | — | §8 |
+| 日志、热重载、拆分配置 | `[log]` / `hot_reload` | `[log]` / `includes` / `loginFailExit` | §9 |
+| IP4P 与 CDN 回源 | `trusted_proxies` / `ipgeo` | `serverAddr` 填 IP4P 域名 / `protocol = "wss"` | §10 |
+| 插件（正向代理 / 静态站点） | — | `plugin` + `plugin_*` 字段 | §11 |
+| group 均衡 / 健康检查 / 限流 | `lb_policy` | `group_key` / `health_check_*` / `bandwidth_limit` | §12 |
+| VirtualNet / P2P | `vnet_port` / `[vnet]` | `[virtualNet]` / `p2pPort` / `xtcp_transport` | §13 |
+
+### 常用片段：私密隧道（stcp，不占公网端口）
+
+**提供者侧 frpc.toml**
+
+```toml
+user = "alice"
+
+[[proxies]]
+name = "rdp"
+type = "stcp"
+localIP = "127.0.0.1"
+localPort = 3389
+secretKey = "换一个双方一致的密钥"
+allowUsers = ["alice"]
+```
+
+**访问者侧 frpc.toml**
+
+```toml
+user = "alice"
+
+[[visitors]]
+name = "rdp-visitor"
+type = "stcp"
+serverName = "rdp"
+serverUser = "alice"
+secretKey = "换一个双方一致的密钥"
+bindAddr = "127.0.0.1"
+bindPort = 13389
+```
+
+> `allowUsers` 比对的是访问者**顶层 `user`**，不是 `[[visitors]]` 的 `name`。
+> stcp 在 Rust ↔ 官方 Go frp 的四种组合里全部实测通过（含 8 MiB 大流量）。
+
+### 常用片段：WSS 同端口直连
+
+**frps.toml** —— 不需要任何 WSS 配置，照常用 `bindPort`：
+
+```toml
+bindAddr = "0.0.0.0"
+bindPort = 7000
+[auth]
+token = "强令牌"
+```
+
+**frpc.toml**
+
+```toml
+serverAddr = "frps.example.com"
+serverPort = 7000
+[auth]
+token = "强令牌"
+
+[transport]
+protocol = "wss"
+[transport.tls]
+serverName = "frps.example.com"
+```
+
+> 同一个 `bindPort` 同时接受 `tcp` / `tls` / `websocket` / `wss`，服务端按连接内容自动判定。
+> 放在 CDN / WAF 后面时**不要配 `websocket.path`**（路径不参与判定，详见
+> [docs/CDN.md](docs/CDN.md)）。
+
+---
+
 ## 从源码构建
 
 要求 Rust 1.75+（推荐 stable）。本项目**不引入任何新的第三方依赖**，

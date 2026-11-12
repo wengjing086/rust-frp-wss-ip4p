@@ -64,7 +64,9 @@ tls_enable = false
 # 是否在 TLS 握手前发送 frp 自定义首字节 0x17（默认 true，与 frpc 默认一致）
 tls_custom_first_byte = true
 
-# 传输协议：tcp（默认）或 quic，**必须与服务端一致**
+# 传输协议：tcp（默认）/ tls / websocket / wss / quic / kcp
+# 用 quic 或 kcp 时**两端要配一致**，且服务端要开对应的 UDP 端口；
+# websocket / wss 由服务端按连接内容自动识别，服务端无需额外配置。
 # 选了 quic 之后 TLS / yamux 两层会被自动跳过（QUIC 自带加密与多路复用，
 # 每条双向流就是一条 frp 连接）。需要防火墙放行 UDP。
 transport_protocol = "tcp"
@@ -360,14 +362,21 @@ log_level = "info"
 
 # ---- WebSocket / WSS 传输 ----
 # 有些防火墙只放行 HTTP(S)，裸 TCP 一律丢包 —— 把控制连接包进 WebSocket 帧
-# 就能穿过去。走的是**同一个端口**，服务端靠路径自动识别，不用改服务端配置。
+# 就能穿过去。走的是**同一个端口**，服务端按「是不是一条合法的 WebSocket
+# 升级请求」自动判定（明文层判一次、TLS 解密后再判一次），不用改服务端配置。
 #
+# 推荐用官方写法：
+#   [transport]
+#   protocol = "wss"          # 或 "websocket"（明文 WS）
+#
+# NFrp 原生开关与上面等价：
 # websocketEnable = true
 #
-# 只有在前置代理（Nginx / CDN）按 Host 或路径分流时才需要改这两项：
+# 只有前置代理按 Host 分流时才需要补 host。**路径不参与服务端判定**：
+# 改 path 既不解决 CDN/WAF 的 403，也不需要服务端同步，留空用默认即可。
+# 403 的真因是握手缺 `Origin`（v0.8.1 起客户端已自动补），详见 docs/CDN.md：
 #   [websocket]
 #   host = "frp.example.com"
-#   path = "/~!frp"           # 留空用官方默认路径，改了必须与服务端一致
 
 # ---- VirtualNet 虚拟网络（[virtualNet]）----
 # 让本机拿到一个虚拟内网地址，与同网段的其他客户端**三层互通**。
