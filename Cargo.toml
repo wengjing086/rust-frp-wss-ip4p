@@ -5,7 +5,7 @@ members = ["common", "server", "client"]
 [workspace.package]
 # 本项目是「Rust-Frp 协议基座 + WSS 直连 + IP4P」的整合发行版。
 # 版本独立于上游；线协议兼容标记（frpc -v 输出）仍固定为 0.71.0，不要改。
-version = "0.8.7"
+version = "0.8.8"
 edition = "2021"
 rust-version = "1.75"
 authors = ["wengjing086", "nfrp contributors"]
