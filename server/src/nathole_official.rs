@@ -1159,6 +1159,8 @@ mod tests {
 
     #[test]
     fn mode_选择与端口预测范围() {
+        // 同上：本测试会 clear 全局 hole_records，必须和所有读写该表的测试串行。
+        let _l = test_lock().blocking_lock();
         hole_records()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1194,6 +1196,7 @@ mod tests {
     /// 这里把 6 个分支的**首个 mode**都钉死，任何一条被改坏都会红。
     #[test]
     fn mode_选择的六个分支与官方一致() {
+        let _l = test_lock().blocking_lock();
         // 不用 clear()：全局表被别的测试共用，清了会让它们拿不到自己的条目
         // （`nat_report_成功会回写分数` 就是这么被搞挂的）。
         // 这里每个用例都用唯一的 session 名，天然隔离。
@@ -1270,6 +1273,7 @@ mod tests {
 
     #[test]
     fn 公网一侧永远做_receiver() {
+        let _l = test_lock().blocking_lock();
         hole_records()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1292,7 +1296,11 @@ mod tests {
         // ★ 这张表是**全局共享**的，多个测试并发跑时会互相 `clear()`。
         //   原先的写法是「clear → 写入 → 之后再去表里读」，中间被别的测试
         //   清一次就 `unwrap()` 到 None（实测确实偶发失败）。
-        //   现在改用唯一的 session 名避免撞车，且不再 clear 别人的数据。
+        //   v0.8.7：根因不止是撞 session 名 —— `configure_analysis_reserve(0)`
+        //   会**清空整张 hole_records 表**，另有几个测试直接 `.clear()`。
+        //   光用唯一 sid 挡不住全表清空，所以这里和所有读写该表的测试
+        //   统一用 test_lock 串行；唯一 sid 仍保留，避免串到别人的数据。
+        let _l = test_lock().blocking_lock();
         let sid = format!("t-report-{}", std::process::id());
         let c = classify_nat_feature(&["1.1.1.1:1000".into(), "1.1.1.1:1002".into()], &[]).unwrap();
         let v = classify_nat_feature(&["2.2.2.2:2000".into(), "2.2.2.2:2000".into()], &[]).unwrap();

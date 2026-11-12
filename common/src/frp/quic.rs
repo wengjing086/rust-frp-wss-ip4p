@@ -609,8 +609,7 @@ mod tests {
     #[test]
     fn alpn_matches_official_frp() {
         assert_eq!(
-            ALPN,
-            b"frp",
+            ALPN, b"frp",
             "官方 frp 的 QUIC NextProtos 写死为 frp，改了就不通"
         );
         let family = alpn_family(ALPN);

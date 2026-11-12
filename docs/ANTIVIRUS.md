@@ -28,7 +28,7 @@
 | 不写自启动 | 不碰注册表 Run 键、不装服务、不建计划任务；需要一个进程时由用户自己配置 | — |
 | 不注入 / 不自修改 | 无 `WriteProcessMemory`、无 `VirtualProtectEx`、无运行时生成代码 | 全代码 |
 | 不起可疑子进程 | Windows 上读系统 DNS 用 `GetNetworkParams` API，而不是 `ipconfig` 子进程 | `common/src/dns.rs` |
-| 可复现构建 + 校验和 | 全部 Release 产物由公开源码在 GitHub Actions 构建，附 `SHA256SUMS.txt` | `.github/workflows/release.yml` |
+| 可复现构建 + 校验和 | 全部 Release 产物由公开源码用仓库内脚本构建，附 `SHA256SUMS.txt`；仓库同时提供 CI 配置供自行核验 | `scripts/build_all.sh`、`ci/ci.yml`、`ci/release.yml` |
 | 开源可审计 | 每个二进制都能对应到具体 commit 与 tag | GitHub Releases |
 
 ### 版本资源是怎么加的
@@ -42,7 +42,7 @@
 ```powershell
 (Get-Item .\frpc.exe).VersionInfo | Format-List *
 # 应看到 CompanyName=wengjing086、FileDescription=frp client (Rust) - ...
-# 以及 FileVersion=0.8.0.0
+# 以及 FileVersion=<当前版本，如 0.8.7.0>
 ```
 
 清单里必须**没有** `requireAdministrator`，且必须有
@@ -81,10 +81,11 @@
 
 ```
 软件名称：rust-frp-wss-ip4p / frpc.exe
-版本：0.8.0.0
+版本：<对应版本，如 0.8.7.0>
 SHA256：<填值>
 源码：https://github.com/wengjing086/rust-frp-wss-ip4p
-构建：GitHub Actions 从上述 commit 公开构建，Release 附 SHA256SUMS.txt
+构建：由上述 tag 的公开源码用仓库内 scripts/build_all.sh 构建，
+     构建配置见仓库内 ci/ci.yml 与 ci/release.yml；Release 附 SHA256SUMS.txt
 用途：开源内网穿透客户端（frp 协议的 Rust 实现），用于自有设备的远程访问
 说明：不含 Go 运行时、无加壳、无自启动、无注入、无运行时下载；
      已内嵌完整版本资源与 asInvoker 清单。判定为 HackTool 属误报。

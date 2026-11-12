@@ -19,9 +19,11 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
 
 use crate::{
-    admin, api_v2, official_api, web_assets,
+    admin, api_v2,
     observability::{encode_json, encode_prometheus, Snapshot},
+    official_api,
     registry::Registry,
+    web_assets,
 };
 use nfrp_common::config::ServerConfig;
 
@@ -905,8 +907,7 @@ const fn concat_headers_redirect() -> [(&'static str, &'static str); SEC_HEADERS
     out
 }
 
-static SEC_HEADERS_WITH_REDIRECT: [(&str, &str); SEC_HEADERS.len() + 1] =
-    concat_headers_redirect();
+static SEC_HEADERS_WITH_REDIRECT: [(&str, &str); SEC_HEADERS.len() + 1] = concat_headers_redirect();
 
 /// 401 用：`WWW-Authenticate` + 安全头。
 const fn concat_headers_auth() -> [(&'static str, &'static str); SEC_HEADERS.len() + 1] {

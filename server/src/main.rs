@@ -138,9 +138,10 @@ async fn main() -> Result<()> {
     // ★ v0.5.3：弱/占位 token 的强告警。
     //
     // 背景（第二轮审计的 B 项）：v1 控制通道的登录凭证是
-    // `md5(token + timestamp)`，而且服务端**对 timestamp 不做新鲜性校验**
-    // （只用报文自报的 ts 重算比对）。攻击者抓到**一条** Login 报文后，
-    // 枚举一个候选 token 只需要 **1 次 MD5** —— 也就是说 token 的实际强度
+    // `md5(token + timestamp)`。服务端自 v0.5.7 起对 timestamp 做 ±300 秒
+    // 新鲜性校验（v0.5.6 铺到主登录、v0.5.7 铺到全部 6 个凭证入口），
+    // 但那只把重放面从"永久"压到 5 分钟。攻击者抓到**一条** Login 报文后
+    // （窗口内即可重放），枚举一个候选 token 只需要 **1 次 MD5** —— 也就是说 token 的实际强度
     // 取决于它自己够不够随机，PBKDF2 那 64 次迭代帮不上忙（那个参数是
     // 官方 golib 硬编码的，改了就跟官方断互通，**不能改**）。
     //
@@ -437,8 +438,8 @@ fn check_token_strength(cfg: &ServerConfig) {
     if len < 16 || classes < 2 {
         tracing::warn!(
             "token 强度偏低（长度 {len}，字符类 {classes} 种）：\
-             v1 登录凭证是 md5(token+timestamp) 且服务端不校验时间戳新鲜性，\
-             攻击者抓到一条登录报文后枚举一个候选只要 1 次 MD5。\
+             v1 登录凭证是 md5(token+timestamp)，timestamp 虽有 ±300 秒新鲜性窗口，\
+             但窗口内抓到一条登录报文后枚举一个候选仍只要 1 次 MD5。\
              建议换成 **至少 16 位、含大小写/数字/符号** 的随机串\
              （例如 `openssl rand -base64 24`），或用 [auth] method = \"oidc\"。"
         );

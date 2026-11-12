@@ -43,13 +43,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release
         run: cargo build --release --workspace
+      # 不允许吞失败：以前写 `|| true`，构建出一个跑不起来的二进制也会让 CI 变绿。
       - name: smoke (version output)
         shell: bash
         run: |
+          set -euo pipefail
           if [ "$RUNNER_OS" = "Windows" ]; then
-            ./target/release/nfrp-server.exe -v || true
-            ./target/release/nfrp-client.exe -v || true
+            ./target/release/nfrp-server.exe -v
+            ./target/release/nfrp-client.exe -v
           else
-            ./target/release/nfrp-server -v || true
-            ./target/release/nfrp-client -v || true
+            ./target/release/nfrp-server -v
+            ./target/release/nfrp-client -v
           fi

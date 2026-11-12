@@ -1247,7 +1247,9 @@ fn cidr_match(spec: &str, ip: &std::net::IpAddr) -> bool {
         (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
             (u32::from(a) as u128, u32::from(*b) as u128, 32u32)
         }
-        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => (u128::from(a), u128::from(*b), 128u32),
+        (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+            (u128::from(a), u128::from(*b), 128u32)
+        }
         _ => return false,
     };
     let prefix = bits.unwrap_or(max).min(max);
@@ -2962,6 +2964,10 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
                     continue;
                 };
                 let client = backend.client;
+                // ★ v0.8.7：同一个代理名以前在这里连查 3 次 proxy_flags
+                // （use_encryption / use_compression / data_key 各一次）。
+                // 结果在一次 PendingUser 构造内不会变，查一次即可。
+                let (proxy_enc, proxy_comp) = client.proxy_flags(&backend.proxy_name);
                 let user = PendingUser {
                     // 必须用**被选中那个后端自己的**代理名：服务端就是靠它
                     // 在 StartWorkConn 里告诉客户端该服务哪条代理，
@@ -2972,18 +2978,11 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
                     client_user: client.user.clone(),
                     client_run_id: client.run_id(),
                     // ★ v0.6.6：数据面标志随用户连接带下去
-                    use_encryption: {
-                        let (e, _) = client.proxy_flags(&backend.proxy_name);
-                        e
-                    },
-                    use_compression: {
-                        let (_, c) = client.proxy_flags(&backend.proxy_name);
-                        c
-                    },
-                    data_key: {
-                        let (e, _) = client.proxy_flags(&backend.proxy_name);
-                        e.then(|| nfrp_common::frp::v1::derive_key(sec.auth_cfg.token.as_bytes()))
-                    },
+                    use_encryption: proxy_enc,
+                    use_compression: proxy_comp,
+                    data_key: proxy_enc.then(|| {
+                        nfrp_common::frp::v1::derive_key_cached(sec.auth_cfg.token.as_bytes())
+                    }),
                     // TCP 路径没有"访客"这一侧，第二个密钥用不到。
                     visitor_key: None,
                     visitor_compression: false,
@@ -3610,14 +3609,12 @@ async fn handle_visitor(
         // work 侧（到 provider 的那条）：跟着**代理**的 transport 走，密钥用 token 派生。
         use_encryption: prov_enc,
         use_compression: prov_comp,
-        data_key: prov_enc.then(|| {
-            nfrp_common::frp::v1::derive_key(token.as_bytes())
-        }),
+        data_key: prov_enc.then(|| nfrp_common::frp::v1::derive_key_cached(token.as_bytes())),
         // visitor 侧（到访客的那条）：跟着**访客自己**在 NewVisitorConn 里声明的开关走，
         // 密钥用 provider 的 secretKey 派生（与签名校验用的是同一个密钥）。
         visitor_key: msg
             .use_encryption
-            .then(|| nfrp_common::frp::v1::derive_key(entry.secret_key.as_bytes())),
+            .then(|| nfrp_common::frp::v1::derive_key_cached(entry.secret_key.as_bytes())),
         visitor_compression: msg.use_compression,
         // visitor 没有公网端口概念
         remote_port: 0,
@@ -3809,15 +3806,11 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
         user_stream.write_all(&leftover).await?;
     }
     let mut work_stream: nfrp_common::frp::stream::BoxStream = if will_wrap {
-        let raw: nfrp_common::frp::stream::BoxStream =
-            Box::pin(nfrp_common::frp::stream::PrefixedStream::new(
-                leftover,
-                work_stream,
-            ));
+        let raw: nfrp_common::frp::stream::BoxStream = Box::pin(
+            nfrp_common::frp::stream::PrefixedStream::new(leftover, work_stream),
+        );
         Box::pin(nfrp_common::frp::proxy_stream::ProxyStream::new(
-            raw,
-            user_key,
-            user_comp,
+            raw, user_key, user_comp,
         ))
     } else {
         Box::pin(work_stream)
@@ -3869,8 +3862,14 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
     let relay_result = match limiter {
         None => util::relay_between(&mut user_stream, &mut work_stream).await,
         Some(lim) => {
-            crate::nlink::relay_throttled(lim, &client_user, &proxy, &mut user_stream, &mut work_stream)
-                .await
+            crate::nlink::relay_throttled(
+                lim,
+                &client_user,
+                &proxy,
+                &mut user_stream,
+                &mut work_stream,
+            )
+            .await
         }
     };
 
@@ -4111,11 +4110,24 @@ mod tests {
     }
 
     #[test]
-    fn limits_from_config_defaults_to_unlimited() {
+    fn limits_from_config_defaults_to_conservative_caps() {
         let cfg = ServerConfig::default();
         let l = limits_from(&cfg);
-        assert_eq!(l.max_total_conns, 0, "默认必须保持向后兼容：不限制");
-        assert_eq!(l.max_clients, 0);
+        // v0.8.7：默认不再是 0（不限），而是示例配置里那组保守值。
+        assert_eq!(l.max_total_conns, 5000);
+        assert_eq!(l.max_clients, 0, "客户端数仍默认不限");
+    }
+
+    #[test]
+    fn explicit_zero_still_means_unlimited() {
+        let cfg = ServerConfig {
+            max_total_conns: 0,
+            max_conns_per_client: 0,
+            max_pending_per_client: 0,
+            ..ServerConfig::default()
+        };
+        let l = limits_from(&cfg);
+        assert_eq!(l.max_total_conns, 0, "显式写 0 必须恢复旧的不限行为");
     }
 
     /// ★ C9-3 修复的回归锁：闸门排满后必须**排队超时放弃**，而不是无限等待。

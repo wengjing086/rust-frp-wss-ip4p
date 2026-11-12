@@ -138,7 +138,10 @@ pub struct ProxyStat {
 impl ProxyStat {
     pub fn today_in_out(&self) -> (u64, u64) {
         (
-            self.ring_in.lock().unwrap_or_else(|e| e.into_inner()).today(),
+            self.ring_in
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .today(),
             self.ring_out
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -429,8 +432,9 @@ impl SessionTable {
                 map.remove(&o);
             }
         }
-        let entry = map.entry(client_id.to_string()).or_insert_with(|| {
-            SessionMeta {
+        let entry = map
+            .entry(client_id.to_string())
+            .or_insert_with(|| SessionMeta {
                 client_id: client_id.to_string(),
                 user: String::new(),
                 run_id: String::new(),
@@ -443,8 +447,7 @@ impl SessionTable {
                 last_connected: now,
                 disconnected: 0,
                 online: false,
-            }
-        });
+            });
         entry.user = user.to_string();
         entry.run_id = run_id.to_string();
         entry.version = version.to_string();
@@ -565,7 +568,9 @@ mod tests {
     #[test]
     fn session_lifecycle() {
         let t = SessionTable::default();
-        t.mark_login("c1", "u", "r1", "0.8.1", "host", "windows", "amd64", "1.2.3.4");
+        t.mark_login(
+            "c1", "u", "r1", "0.8.1", "host", "windows", "amd64", "1.2.3.4",
+        );
         assert_eq!(t.online_count(), 1);
         let m = t.get("c1").unwrap();
         assert_eq!(m.hostname, "host");
@@ -574,7 +579,9 @@ mod tests {
         assert_eq!(t.online_count(), 0);
         assert!(t.get("c1").unwrap().disconnected > 0);
         // 重新登录恢复在线。
-        t.mark_login("c1", "u", "r2", "0.8.1", "host", "windows", "amd64", "1.2.3.4");
+        t.mark_login(
+            "c1", "u", "r2", "0.8.1", "host", "windows", "amd64", "1.2.3.4",
+        );
         assert_eq!(t.online_count(), 1);
         assert_eq!(t.get("c1").unwrap().run_id, "r2");
     }

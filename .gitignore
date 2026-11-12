@@ -33,8 +33,10 @@ __pycache__/
 
 # 第三方二进制（Wintun 驱动），由用户自行下载：https://www.wintun.net/
 /assets/wintun.dll
-# GitHub Actions 模板保存在 ci/ 下（当前令牌无 workflow 权限，无法直接推 .github/workflows/）。
-# 启用 CI 时把 ci/*.yml 复制到 .github/workflows/ 再提交，详见 ci/README.md。
+# CI 配置已随源码入库在 ci/ 下；.github/workflows/ 放的是逐字节相同的待启用副本。
+# 当前 PAT 只有 repo 权限、没有 workflow scope，GitHub 会拒绝推送该目录
+# （REST API 写入同样返回 404）。启用步骤见 ci/README.md：
+# 给 token 勾上 workflow 后，删掉下面这行、git add .github/workflows/ 再提交即可。
 /.github/workflows/
 
 # 本地打包产物（GitHub Release 由 ci/release.yml 或手动上传）

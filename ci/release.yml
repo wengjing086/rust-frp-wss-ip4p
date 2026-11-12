@@ -1,19 +1,30 @@
-name: Release
+# 发布产物的「可复现性校验」构建。
+#
+# 注意：这个 workflow **不写 GitHub Release**。正式 Release 资产由维护者用
+# `scripts/build_all.sh` 在本机交叉编译（gnu / musl / 版本资源），再用
+# `scripts/make_release.py` 上传。原因：
+#   1. Windows 交付物用 x86_64-pc-windows-gnu + rust-lld 带 VERSIONINFO，
+#      Actions 上的 msvc 产物虽然同名，二进制不同，不能互相替代；
+#   2. Linux arm64 静态 musl 需要本地 zig 交叉工具链；Windows arm64 需要 clang；
+#   3. 两边同时上传同名资产会互相覆盖，造成「已验证产物」与「实际下载产物」不一致。
+# 因此这里只产出**与正式资产同名**的独立可执行文件 + SHA256SUMS，作为
+# 「公开源码确实能构建出这个东西」的旁证，供人工比对，不参与分发。
+name: Release Build Verification
 
 on:
+  workflow_dispatch:
   push:
     tags: ["v*"]
-  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    name: build (${{ matrix.suffix }})
+    name: verify build (${{ matrix.suffix }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -23,17 +34,14 @@ jobs:
             target: x86_64-pc-windows-msvc
             suffix: windows_amd64
             exe: ".exe"
-            archive: zip
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            suffix: linux_amd64_musl
+            suffix: linux_amd64
             exe: ""
-            archive: tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
             suffix: darwin_arm64
             exe: ""
-            archive: tar.gz
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -50,47 +58,43 @@ jobs:
       - name: cargo build --release
         run: cargo build --release --workspace --target ${{ matrix.target }}
 
-      - name: package
+      # 契约与 dist/ 一致：不放压缩包，每平台两个独立可执行文件。
+      - name: name artifacts and smoke test
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p pkg
-          cp "target/${{ matrix.target }}/release/nfrp-server${{ matrix.exe }}" "pkg/frps${{ matrix.exe }}"
-          cp "target/${{ matrix.target }}/release/nfrp-client${{ matrix.exe }}" "pkg/frpc${{ matrix.exe }}"
-          cp assets/frps.toml assets/frpc.toml README.md LICENSE NOTICE pkg/
-          cp -R docs pkg/
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            (cd pkg && powershell -NoProfile -Command "Compress-Archive -Path * -DestinationPath ../frp_${{ matrix.suffix }}.zip -Force")
-          else
-            tar -C pkg -czf "frp_${{ matrix.suffix }}.tar.gz" .
-          fi
+          cp "target/${{ matrix.target }}/release/nfrp-server${{ matrix.exe }}" \
+             "pkg/frps_${{ matrix.suffix }}${{ matrix.exe }}"
+          cp "target/${{ matrix.target }}/release/nfrp-client${{ matrix.exe }}" \
+             "pkg/frpc_${{ matrix.suffix }}${{ matrix.exe }}"
+          "pkg/frps_${{ matrix.suffix }}${{ matrix.exe }}" --version
+          "pkg/frpc_${{ matrix.suffix }}${{ matrix.exe }}" --version
 
       - uses: actions/upload-artifact@v4
         with:
-          name: frp-${{ matrix.suffix }}
-          path: frp_${{ matrix.suffix }}.*
+          name: verify-${{ matrix.suffix }}
+          path: pkg/frp*
           if-no-files-found: error
 
-  publish:
-    name: publish assets + SHA256SUMS
+  checksums:
+    name: SHA256SUMS (verification only)
     needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: frp-*
+          pattern: verify-*
           merge-multiple: true
           path: all
       - name: checksums
         run: |
+          set -euo pipefail
           cd all
-          sha256sum frp_* > SHA256SUMS.txt
+          sha256sum frps_* frpc_* > SHA256SUMS.txt
           cat SHA256SUMS.txt
-      - name: upload to release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ github.ref_name }}
-          files: |
-            all/frp_*
-            all/SHA256SUMS.txt
-          fail_on_unmatched_files: true
+          name: verify-SHA256SUMS
+          path: all/SHA256SUMS.txt
+          if-no-files-found: error

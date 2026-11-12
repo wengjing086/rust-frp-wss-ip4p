@@ -785,7 +785,10 @@ mod tests {
         let h = hint_for_status(403, esa_403);
         // 首要原因是缺 Origin（实测结论），路径只是次要怀疑对象。
         assert!(h.contains("Origin"), "403 必须先提示缺 Origin：{h}");
-        assert!(h.contains("websocket.path"), "403 还应给出换路径的兜底：{h}");
+        assert!(
+            h.contains("websocket.path"),
+            "403 还应给出换路径的兜底：{h}"
+        );
 
         let esa_520 = "HTTP/1.1 520 Origin Error\r\nServer: ESA\r\n\r\n";
         let h = hint_for_status(520, esa_520);
@@ -796,7 +799,10 @@ mod tests {
         let plain = "HTTP/1.1 403 Forbidden\r\nServer: nfrp\r\n\r\n";
         assert!(hint_for_status(403, plain).contains("auth.token"));
 
-        assert_eq!(hint_for_status(418, "HTTP/1.1 418 I'm a teapot\r\n\r\n"), "");
+        assert_eq!(
+            hint_for_status(418, "HTTP/1.1 418 I'm a teapot\r\n\r\n"),
+            ""
+        );
     }
 
     /// RFC 6455 的官方向量：key 固定时 Accept 必须等于这个值。
@@ -855,7 +861,9 @@ mod tests {
             tokio::io::AsyncWriteExt::write_all(&mut ws, &payload)
                 .await
                 .expect("写");
-            tokio::io::AsyncWriteExt::flush(&mut ws).await.expect("flush");
+            tokio::io::AsyncWriteExt::flush(&mut ws)
+                .await
+                .expect("flush");
             tokio::io::AsyncWriteExt::shutdown(&mut ws)
                 .await
                 .expect("shutdown");
@@ -955,7 +963,10 @@ mod tests {
             req.contains("Origin: http://frps.example.com"),
             "Origin 必须与 Host 同源。实际请求：\n{req}"
         );
-        assert!(req.contains("Host: frps.example.com"), "Host 头不对：\n{req}");
+        assert!(
+            req.contains("Host: frps.example.com"),
+            "Host 头不对：\n{req}"
+        );
     }
 
     /// 掩码规则：客户端发的帧必须带掩码，服务端发的必须不带。

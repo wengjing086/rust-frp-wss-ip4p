@@ -638,7 +638,7 @@ fn wrap_work_stream(
     if !enc && !comp {
         return Box::pin(PrefixedStream::new(leftover, stream));
     }
-    let key = enc.then(|| nfrp_common::frp::v1::derive_key(token.as_bytes()));
+    let key = enc.then(|| nfrp_common::frp::v1::derive_key_cached(token.as_bytes()));
     Box::pin(nfrp_common::frp::proxy_stream::ProxyStream::new(
         PrefixedStream::new(leftover, stream),
         key,

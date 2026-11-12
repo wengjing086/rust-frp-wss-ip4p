@@ -2316,7 +2316,8 @@ async fn work_conn_flow(
     let eff_enc = proxy.use_encryption || link.cfg.use_encryption;
     let eff_comp = proxy.use_compression || link.cfg.use_compression;
     if eff_enc || eff_comp {
-        let key = eff_enc.then(|| nfrp_common::frp::v1::derive_key(link.cfg.token.as_bytes()));
+        let key =
+            eff_enc.then(|| nfrp_common::frp::v1::derive_key_cached(link.cfg.token.as_bytes()));
         debug!(
             proxy = %start.proxy_name,
             enc = eff_enc,

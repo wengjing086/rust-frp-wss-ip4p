@@ -197,7 +197,9 @@ Go 版 frp 常被报成 `HackTool:Win32/Frp` 之类，主因是 Go 运行时特�
 - 完整 VERSIONINFO（公司 / 产品 / 描述 / 版本 / 版权 / 原始文件名）；
 - 应用清单声明 `asInvoker`（不请求管理员权限）、DPI / 长路径感知；
 - 不加壳、不压缩、不混淆、不注入、不自修改、不写自启动、不在运行时下载可执行内容；
-- 全部二进制由 GitHub Actions 从公开源码构建，附 `SHA256SUMS.txt` 便于核验与申诉。
+- 全部二进制由仓库内 `scripts/build_all.sh` 从公开源码构建，附 `SHA256SUMS.txt`
+  便于核验与申诉；仓库随源码提供 GitHub Actions 配置（已入库的 `ci/*.yml`），
+  启用后承担 fmt / clippy / 单测门禁与独立的可复现性校验构建。
 
 详见 [docs/ANTIVIRUS.md](docs/ANTIVIRUS.md)（含误报申诉渠道与自证清单）。
 **没有任何措施能保证所有厂商零误报**；遇到误报请走正规申诉，而不是加壳。
@@ -267,6 +269,61 @@ ALPN 不一致时 QUIC 直接以 `cryptographic handshake failed: error 120` 断
 混搭时最稳的是 `tcp` 与 `tls`，四种组合全绿。
 
 
+## 生产部署建议配置
+
+以下几项**默认值直接影响公网部署的安全与资源上限**，以前只在源码注释里写过，
+这里集中列出来。配置项都是 `frps.toml` 的顶层键。
+
+### 连接数上限（v0.8.7 起有了保守默认值）
+
+| 配置键 | 作用 | v0.8.7 默认 | 显式设 `0` |
+|---|---|---|---|
+| `max_total_conns` | 全局同时活跃的转发连接数 | `5000` | 不限 |
+| `max_conns_per_client` | 单个客户端同时活跃的转发连接数 | `200` | 不限 |
+| `max_pending_per_client` | 单个客户端排队等工作连接的请求数 | `64` | 不限 |
+| `max_clients` | 同时在线客户端数 | `0`（不限） | — |
+| `max_proxies_per_client` | 单个客户端可注册的代理数 | `0`（不限） | — |
+
+v0.8.6 及以前这五项**全是 `0`（不限）**：只要一个认证通过的客户端不停建连，
+tokio task 数量就会线性上涨。目前预认证握手有独立闸门（`PREAUTH_MAX = 2048`、
+5 秒等待），但认证后的转发连接此前没有上限。如果你的客户端特别多或单客户端
+并发很高，按实际容量调大即可；想恢复旧行为就显式写 `0`。
+
+```toml
+# frps.toml（一般不用写，下面是默认值）
+max_total_conns = 5000
+max_conns_per_client = 200
+max_pending_per_client = 64
+
+# 对外提供服务时强烈建议同时配端口白名单
+allowPorts = ["20000-40000"]
+```
+
+### 报文大小与 TLS 校验
+
+- **`udpPacketSize` 默认 `65507`，官方 frp 默认 `1500`。** 这是历史行为，
+  为了让现有用户的大 UDP 报文不被截断而保留；取值范围 `[1, 65507]`。
+  跨实现混搭时若对端按 1500 分片，行为会有差异，遇到大包问题优先检查这一项。
+- **`transport.tls.enable = true` 默认并不校验证书**（与官方 frp 一致，
+  `InsecureSkipVerify = true`）。它能防被动窃听，但**不能防主动中间人**。
+  不改默认是为了保住「官方 frpc 零配置直连」这条链路；自有 CA + 两端都是
+  本项目的部署，建议显式开启校验：
+
+  ```toml
+  # frpc.toml
+  [transport.tls]
+  trustedCaFile = "/etc/ssl/ca.pem"   # 服务端证书或签发它的 CA
+  tlsServerName = "frps.example.com"  # 必须能对上证书里的名字
+  verifyServerCert = true
+  ```
+
+  开启后**官方 frpc 默认连不上**（它不提供客户端证书），所以这个开关只适合
+  「自有 frpc + 自有 frps」的闭环部署，混搭场景请保持默认。
+- 前端有反代 / CDN 时，把回源网段写进 `trusted_proxies`，否则 `X-Forwarded-For`
+  之类的来源信息不可信。
+
+---
+
 ## 兼容性与限制
 
 - 线协议兼容官方 frp **v0.71.0**（v1 默认，可选 v2）；`frpc -v` 输出仍为裸 `0.71.0`。
@@ -278,11 +335,36 @@ ALPN 不一致时 QUIC 直接以 `cryptographic handshake failed: error 120` 断
 - 反向代理 / nginx 场景：wss 客户端的 TLS SNI 与 WebSocket Host 仍使用配置里的
   原始域名，IP4P 只改变实际连接目标，不会破坏按 Host 分流与证书校验。
 
+### 已知不支持（不是 bug，别当成故障排查）
+
+这些是源码里明确写出的取舍，散落在注释里容易踩坑，集中列在这里：
+
+| 项 | 说明 |
+|---|---|
+| KCP 跨实现 | 本项目 KCP 是 `ikcp` / `kcp-go` 的精简移植，无 FEC、无 kcp-go 会话握手，字节层面不与官方互通。跨官方请用 `tcp` / `tls` / `websocket` / `quic`。 |
+| 本项目 frpc `--wss-->` 官方 frps | 官方 frps 在 TLS **之前**做明文 `GET /~!frp` 前缀嗅探，wss 密文无法命中；官方自己的客户端也不支持这种直连，需前置 nginx 终结 TLS。 |
+| xtcp 跨实现 / xtcp 连官方 frps | 官方 provider 只认 `NatHoleSid`、不接中继通道，官方 visitor 也没有中继回退；官方 frps 不提供 xtcp 中继端口。跨版本需要 P2P 时请改用 `stcp`（四种组合实测全通，含 8 MiB）。 |
+| VirtualNet 的 TUN 设备（macOS） | 平台层未实现，会**明确报错**，不会假装成功；Linux / Windows 可用。 |
+| legacy `frpc.ini` 里的 `tcpmux` | 旧 INI 解析路径不支持该类型，会报错而非静默降级。**TOML 配置路径的 tcpmux 是支持的**，上面的互通矩阵标 ✅ 指的是 TOML。 |
+| OIDC discovery 遇到 302 | 内置 HTTP 客户端不支持 HTTP/2、重定向、cookie。个别 IdP 的 discovery 文档会 302，请把 `tokenEndpointURL` / `issuer` 直接写成最终地址。 |
+| `protocol = "nfrp"` 之类的自研协议 | 尚未实现，配置选到会直接报错；请用 `frp-v1`（默认）或 `frp-v2`。 |
+| Windows ARM64 二进制 | 构建需要 clang + gnullvm，当前环境缺 clang，v0.8.6 / v0.8.7 未提供；以 Release 的 `SHA256SUMS.txt` 实际列出的文件为准。 |
+
+跨实现实测细节见 `_interop/compat_go.py`（41 项用例，可自行复跑）。
+
 ---
 
 ## 安全与免责声明
 
-- 部署到公网请务必使用强 token、开启 TLS 并限制 `allowPorts`。
+- 部署到公网请务必使用**强 token**（至少 16 位、含大小写/数字/符号）、开启 TLS
+  并限制 `allowPorts`。v1 登录凭证是 `md5(token + timestamp)`，服务端虽有 ±300 秒
+  新鲜性窗口，但窗口内抓到一条 Login 仍能离线枚举 token，PBKDF2 的 64 轮帮不上忙
+  —— token 强度只能靠自己。启动时会对此告警。
+- **「开启 TLS」不等于防中间人**：默认不校验证书（见上节），只防被动窃听。
+  需要防主动 MITM 请在自有两端显式开启 `verifyServerCert` + `trustedCaFile`。
+- `panic = "abort"` 是有意的体积取舍，意味着任一连接任务 panic 会终止整个进程。
+  部署在 Linux / OpenWrt 时请让 procd 或 systemd 配 `respawn` / `Restart=always`，
+  把「全服掉线」降级成「自动拉起」；本项目自带的 procd 脚本已包含该设置。
 - 本软件仅供在**你拥有或获得明确授权**的设备与网络上使用；使用者须自行遵守
   所在地法律法规。
 - 许可证：**Apache License 2.0**，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。

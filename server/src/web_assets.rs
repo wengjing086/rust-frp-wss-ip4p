@@ -16,7 +16,11 @@
 
 /// `(路径后缀, 内容, Content-Type)`
 pub static ASSETS: &[(&str, &[u8], &str)] = &[
-    ("index.html", include_bytes!("../web/dist/index.html"), "text/html; charset=utf-8"),
+    (
+        "index.html",
+        include_bytes!("../web/dist/index.html"),
+        "text/html; charset=utf-8",
+    ),
     (
         "index-C-aGI3M_.js",
         include_bytes!("../web/dist/index-C-aGI3M_.js"),
@@ -27,7 +31,11 @@ pub static ASSETS: &[(&str, &[u8], &str)] = &[
         include_bytes!("../web/dist/index-B-mzYQ4X.css"),
         "text/css; charset=utf-8",
     ),
-    ("favicon.ico", include_bytes!("../web/dist/favicon.ico"), "image/x-icon"),
+    (
+        "favicon.ico",
+        include_bytes!("../web/dist/favicon.ico"),
+        "image/x-icon",
+    ),
 ];
 
 /// 按 `/static/` 之后的相对路径查资源。

@@ -623,20 +623,25 @@ pub struct ServerConfig {
     #[serde(default)]
     pub disable_print_color: bool,
 
-    // ---- 资源上限（0 = 不限，默认全部不限制以保持向后兼容）----
-    /// 全局同时活跃的转发连接数上限。
-    #[serde(default)]
+    // ---- 资源上限（0 = 不限）----
+    // ★ v0.8.7：下面三项的默认值从 0 改成保守上限。
+    // 注意必须用 `#[serde(default = "...")]` 指定函数，不能只改 `impl Default`：
+    // 本结构体没有容器级 `#[serde(default)]`，字段级 `#[serde(default)]` 会取
+    // `usize::default()` = 0，导致「TOML 解析出来的配置」和「代码里 new 出来的
+    // 默认配置」两套默认值不一致 —— 这类坑之前在 INI 的 bind_port 上踩过。
+    /// 全局同时活跃的转发连接数上限（默认 5000，0 = 不限）。
+    #[serde(default = "default_max_total_conns")]
     pub max_total_conns: usize,
-    /// 同时在线的客户端数上限。
+    /// 同时在线的客户端数上限（默认 0 = 不限）。
     #[serde(default)]
     pub max_clients: usize,
-    /// 单个客户端同时活跃的转发连接数上限。
-    #[serde(default)]
+    /// 单个客户端同时活跃的转发连接数上限（默认 200，0 = 不限）。
+    #[serde(default = "default_max_conns_per_client")]
     pub max_conns_per_client: usize,
-    /// 单个客户端待配对队列长度上限（用户连接排着等工作连接）。
-    #[serde(default)]
+    /// 单个客户端待配对队列长度上限（默认 64，0 = 不限）。
+    #[serde(default = "default_max_pending_per_client")]
     pub max_pending_per_client: usize,
-    /// 单个客户端可注册的代理数上限。
+    /// 单个客户端可注册的代理数上限（默认 0 = 不限）。
     #[serde(default)]
     pub max_proxies_per_client: usize,
 
@@ -1408,10 +1413,10 @@ impl Default for ServerConfig {
             transport_protocol: default_transport_protocol(),
             kcp_bind_port: None,
             quic_bind_port: None,
-            max_total_conns: 0,
+            max_total_conns: default_max_total_conns(),
             max_clients: 0,
-            max_conns_per_client: 0,
-            max_pending_per_client: 0,
+            max_conns_per_client: default_max_conns_per_client(),
+            max_pending_per_client: default_max_pending_per_client(),
             max_proxies_per_client: 0,
             // 空串 = roundrobin（与官方 frp 的 group 行为一致）
             lb_policy: String::new(),
@@ -3079,6 +3084,17 @@ fn default_max_clock_skew() -> u64 {
 fn default_control_port() -> u16 {
     DEFAULT_CONTROL_PORT
 }
+// v0.8.7：三道转发闸门给保守默认值。以前是 0（不限），认证通过的客户端
+// 只要不停建连就能把 tokio task 数推到 OOM。显式写 0 仍可恢复旧行为。
+fn default_max_total_conns() -> usize {
+    5000
+}
+fn default_max_conns_per_client() -> usize {
+    200
+}
+fn default_max_pending_per_client() -> usize {
+    64
+}
 fn default_work_port() -> u16 {
     DEFAULT_WORK_PORT
 }
@@ -4112,7 +4128,11 @@ mod tests {
         .unwrap();
 
         let cfg = ServerConfig::load(&path).expect("老式 frps.ini 必须能加载");
-        assert_eq!(cfg.frp_bind_port(), 7100, "bind_port 要真正生效（不能静默退回 7000）");
+        assert_eq!(
+            cfg.frp_bind_port(),
+            7100,
+            "bind_port 要真正生效（不能静默退回 7000）"
+        );
         assert_eq!(cfg.token, "legacy-token");
         assert_eq!(cfg.dashboard_port, Some(7500));
         assert_eq!(cfg.dashboard_user, "admin");
@@ -4504,6 +4524,28 @@ keyFile = "key.pem"
             cfg.web_server.tls.files().unwrap(),
             Some(("cert.pem", "key.pem"))
         );
+    }
+
+    #[test]
+    fn server_toml_without_limits_matches_default_impl() {
+        // ★ v0.8.7 回归锁：字段级 `#[serde(default)]` 会绕过 `impl Default`，
+        // 直接取 `usize::default()` = 0。只改 Default 而不给 serde 指定默认函数，
+        // 就会出现「代码里 new 出来有限流、读 TOML 出来没限流」这种最危险的
+        // 静默不一致（INI 的 bind_port 映射以前踩过同类坑）。
+        let parsed: ServerConfig = toml::from_str("bindPort = 7000").expect("最小配置必须可解析");
+        let def = ServerConfig::default();
+        assert_eq!(parsed.max_total_conns, def.max_total_conns);
+        assert_eq!(parsed.max_conns_per_client, def.max_conns_per_client);
+        assert_eq!(parsed.max_pending_per_client, def.max_pending_per_client);
+        assert_eq!(parsed.max_total_conns, 5000);
+        assert_eq!(parsed.max_conns_per_client, 200);
+        assert_eq!(parsed.max_pending_per_client, 64);
+
+        // 显式写 0 必须能覆盖默认值，恢复「不限」的旧行为。
+        let unlimited: ServerConfig =
+            toml::from_str("max_total_conns = 0\nmax_conns_per_client = 0").unwrap();
+        assert_eq!(unlimited.max_total_conns, 0);
+        assert_eq!(unlimited.max_conns_per_client, 0);
     }
 
     #[test]

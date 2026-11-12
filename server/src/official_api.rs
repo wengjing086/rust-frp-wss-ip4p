@@ -206,7 +206,10 @@ fn proxy_v2_json(p: &ProxyStat) -> serde_json::Value {
             let mut b = base.as_object().cloned().unwrap_or_default();
             b.insert(
                 "remotePort".into(),
-                p.conf.get("remotePort").cloned().unwrap_or(serde_json::json!(0)),
+                p.conf
+                    .get("remotePort")
+                    .cloned()
+                    .unwrap_or(serde_json::json!(0)),
             );
             serde_json::json!({ p.proxy_type.clone(): b })
         }
@@ -359,7 +362,10 @@ pub async fn route(
                 let kb = b["key"].as_str().unwrap_or("");
                 ka.cmp(kb)
             });
-            return Some(Response::json(200, serde_json::Value::Array(items).to_string()));
+            return Some(Response::json(
+                200,
+                serde_json::Value::Array(items).to_string(),
+            ));
         }
         _ => {}
     }
@@ -640,7 +646,13 @@ mod tests {
         assert_eq!(spec["stcp"]["loadBalancer"]["group"], "");
 
         // tcp 类型的 remotePort 也应落在自己的块里。
-        stats.open("rdp", "tcp", "u", "c2", serde_json::json!({"remotePort": 6010}));
+        stats.open(
+            "rdp",
+            "tcp",
+            "u",
+            "c2",
+            serde_json::json!({"remotePort": 6010}),
+        );
         let body = proxy_v2_json(&stats.get("rdp").unwrap());
         let spec = &body["spec"];
         assert_eq!(spec["type"], "tcp");

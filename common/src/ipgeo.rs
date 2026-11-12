@@ -61,10 +61,40 @@ const QUERY_TIMEOUT_SECS: u64 = 5;
 /// 百度接口只回中文地址、不给国家码 —— `美国加利福尼亚圣何塞` 与
 /// `浙江省杭州市` 长得一样，只能靠"省名是否在白名单里"来区分。
 const PROVINCES: [&str; 34] = [
-    "北京", "天津", "河北", "山西", "内蒙古", "辽宁", "吉林", "黑龙江", "上海", "江苏",
-    "浙江", "安徽", "福建", "江西", "山东", "河南", "湖北", "湖南", "广东", "广西",
-    "海南", "重庆", "四川", "贵州", "云南", "西藏", "陕西", "甘肃", "青海", "宁夏",
-    "新疆", "台湾", "香港", "澳门",
+    "北京",
+    "天津",
+    "河北",
+    "山西",
+    "内蒙古",
+    "辽宁",
+    "吉林",
+    "黑龙江",
+    "上海",
+    "江苏",
+    "浙江",
+    "安徽",
+    "福建",
+    "江西",
+    "山东",
+    "河南",
+    "湖北",
+    "湖南",
+    "广东",
+    "广西",
+    "海南",
+    "重庆",
+    "四川",
+    "贵州",
+    "云南",
+    "西藏",
+    "陕西",
+    "甘肃",
+    "青海",
+    "宁夏",
+    "新疆",
+    "台湾",
+    "香港",
+    "澳门",
 ];
 
 /// 一条归属地信息。字段全部为**已清洗**的纯文本。
@@ -238,13 +268,7 @@ impl IpGeo {
         {
             let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
             g.inflight.remove(ip);
-            g.map.insert(
-                ip.to_string(),
-                Entry {
-                    d: display,
-                    t: now,
-                },
-            );
+            g.map.insert(ip.to_string(), Entry { d: display, t: now });
             if g.map.len() > MAX_ENTRIES {
                 evict_oldest(&mut g.map);
             }
@@ -355,7 +379,10 @@ async fn lookup(ip: &str) -> Option<Geo> {
         timeout_secs: QUERY_TIMEOUT_SECS,
         ..Default::default()
     };
-    let ua = [("User-Agent", "nfrp/0.8 (+https://github.com/wengjing086/rust-frp-wss-ip4p)")];
+    let ua = [(
+        "User-Agent",
+        "nfrp/0.8 (+https://github.com/wengjing086/rust-frp-wss-ip4p)",
+    )];
     for (name, url) in [
         (
             "baidu",
@@ -435,7 +462,12 @@ fn parse_ipsb(v: &serde_json::Value) -> Option<Geo> {
         country_code: clean(v["country_code"].as_str().unwrap_or("")).to_uppercase(),
         region: clean(v["region"].as_str().unwrap_or("")),
         city: clean(v["city"].as_str().unwrap_or("")),
-        isp: clean(v["isp"].as_str().or(v["organization"].as_str()).unwrap_or("")),
+        isp: clean(
+            v["isp"]
+                .as_str()
+                .or(v["organization"].as_str())
+                .unwrap_or(""),
+        ),
     };
     (!g.country_code.is_empty()).then_some(g)
 }
@@ -574,10 +606,9 @@ mod tests {
 
     #[test]
     fn 百度直辖市的省市同名不重复() {
-        let v: serde_json::Value = serde_json::from_str(
-            r#"{"status":"0","data":[{"location":"北京市北京市 联通"}]}"#,
-        )
-        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"status":"0","data":[{"location":"北京市北京市 联通"}]}"#)
+                .unwrap();
         let g = parse_baidu(&v).unwrap();
         assert_eq!(g.display(), "北京 联通", "直辖市不该出现两次");
     }
@@ -702,13 +733,16 @@ mod tests {
     #[test]
     fn 命中缓存时拼接归属地() {
         let g = IpGeo::new(true, None);
-        g.store("223.5.5.5", Some(Geo {
-            country_code: "CN".into(),
-            region: "浙江省".into(),
-            city: "杭州市".into(),
-            isp: "阿里云".into(),
-            ..Default::default()
-        }));
+        g.store(
+            "223.5.5.5",
+            Some(Geo {
+                country_code: "CN".into(),
+                region: "浙江省".into(),
+                city: "杭州市".into(),
+                isp: "阿里云".into(),
+                ..Default::default()
+            }),
+        );
         assert_eq!(g.annotate("223.5.5.5"), "223.5.5.5 (浙江 杭州 阿里云)");
         // 负缓存：查过但没结果 → 只显示 IP
         g.store("8.8.8.8", None);

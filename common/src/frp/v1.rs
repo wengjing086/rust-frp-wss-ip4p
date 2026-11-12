@@ -64,6 +64,8 @@ use aes::Aes128;
 use anyhow::{bail, Result};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
 // 消息类型字节（pkg/msg/msg.go）
@@ -275,6 +277,35 @@ pub fn derive_key(token: &[u8]) -> [u8; KEY_LEN] {
     key
 }
 
+/// 派生结果的进程级缓存，供 [`derive_key_cached`] 使用。
+///
+/// 为什么按 token 内容做键、而不是 `OnceLock<[u8; 16]>` 只存一个值：
+/// 控制通道 / TCP 数据面用 `auth.token`，但 **stcp visitor 侧用的是每个代理
+/// 各自的 `secretKey`**（见 `server/src/serve.rs` 的 visitor 配对）。单值缓存
+/// 会让第二条隧道拿到错误的密钥。
+static DERIVED_KEYS: OnceLock<Mutex<HashMap<Vec<u8>, [u8; KEY_LEN]>>> = OnceLock::new();
+
+/// 与 [`derive_key`] 结果**逐字节相同**，但同 token 只算一次。
+///
+/// token 是进程级常量，而 [`derive_key`] 是 64 轮 HMAC-SHA1。以前每条新连接
+/// （控制通道、每条加密隧道、stcp 双侧）都重算一遍，高并发建连时纯属 CPU 浪费。
+/// 缓存只影响计算次数，不改变任何线协议字节；官方向量测试仍直接测 [`derive_key`]。
+///
+/// 锁中毒时按项目惯例取 `into_inner()` 继续用（`panic = "abort"` 下不会中毒，
+/// 但 debug/test 构建仍可能遇到）。
+pub fn derive_key_cached(token: &[u8]) -> [u8; KEY_LEN] {
+    let lock = DERIVED_KEYS.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let map = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = map.get(token) {
+            return *key;
+        }
+    }
+    let key = derive_key(token);
+    let mut map = lock.lock().unwrap_or_else(|e| e.into_inner());
+    *map.entry(token.to_vec()).or_insert(key)
+}
+
 // ---------------------------------------------------------------------------
 // AES-128-CFB128 流密码（字节粒度，跨写保持状态）
 // ---------------------------------------------------------------------------
@@ -378,7 +409,7 @@ pub struct CryptoStream {
 impl CryptoStream {
     /// `token` 就是 frp 的认证 token（登录用的同一份）。
     pub fn new(token: &str) -> Self {
-        Self::with_key(derive_key(token.as_bytes()))
+        Self::with_key(derive_key_cached(token.as_bytes()))
     }
 
     /// 直接指定派生好的密钥（测试用，能对死官方向量）。
@@ -595,6 +626,35 @@ mod tests {
     // -----------------------------------------------------------------------
     // 密钥派生（金标准向量）
     // -----------------------------------------------------------------------
+
+    /// v0.8.7：缓存版必须与纯派生逐字节一致，且**不同 token 不能串值**。
+    /// 后者尤其重要：stcp visitor 用 `secretKey` 派生，和普通 `auth.token`
+    /// 共用一个进程级缓存，串了就是「隧道能连上但数据全乱」。
+    #[test]
+    fn 缓存派生与纯派生一致且按_token_隔离() {
+        let tokens: &[&[u8]] = &[
+            b"your_secret_token",
+            b"interop-token-123",
+            b"",
+            b"another-secret-key",
+        ];
+        for t in tokens {
+            assert_eq!(
+                derive_key_cached(t),
+                derive_key(t),
+                "首次（未命中缓存）必须一致"
+            );
+        }
+        // 第二遍走缓存命中分支
+        for t in tokens {
+            assert_eq!(derive_key_cached(t), derive_key(t), "命中缓存后仍必须一致");
+        }
+        assert_ne!(
+            derive_key_cached(b"your_secret_token"),
+            derive_key_cached(b"another-secret-key"),
+            "不同 token 不能拿到同一把密钥"
+        );
+    }
 
     /// 对照 Python `hashlib` 的 PBKDF2-HMAC-SHA1 算出的向量。
     ///

@@ -35,11 +35,7 @@ pub fn describe(ip: &IpAddr) -> IpDisplay {
     g.request(&raw);
     let full = g.annotate(&raw);
     let geo = g.cached(&raw).unwrap_or_default();
-    IpDisplay {
-        ip: raw,
-        geo,
-        full,
-    }
+    IpDisplay { ip: raw, geo, full }
 }
 
 #[cfg(test)]
