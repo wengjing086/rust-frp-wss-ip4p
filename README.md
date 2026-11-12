@@ -13,35 +13,23 @@
 先看一眼它长什么样 —— 左边是没公网 IP 的内网，右边是公网上的 frps：
 
 ```mermaid
-flowchart LR
-  subgraph LAN["🏠 内网（无公网 IP）"]
-    APP["业务服务<br/>RDP / SSH / Web"]
-    FRPC["frpc<br/>本项目 或 官方 frp"]
-  end
-  subgraph EDGE["☁️ 公网链路（可选）"]
-    CDN["CDN / WAF<br/>路径 /ws 可自定义"]
-    IP4P["IP4P 解析<br/>TXT / AAAA → IPv4:端口"]
-  end
-  subgraph SRV["🌐 公网服务器"]
-    PORT["frps · bindPort 7000<br/>同端口 TCP / TLS / WS / WSS"]
-    CORE["frp v0.71.0 控制面<br/>yamux + 工作连接池"]
-    PANEL["内嵌面板<br/>真实 IP · 归属地 · 流量"]
-  end
-  USER["💻 外部访问者<br/>remotePort / stcp visitor"]
+flowchart TB
+  LAN["🏠 内网（无公网 IP）<br/>业务服务 RDP / SSH / Web 接到 frpc"]
+  EDGE["☁️ 可选链路<br/>CDN / WAF：路径 /ws 可自定义<br/>IP4P：TXT / AAAA → IPv4:端口，覆盖拨号目标"]
+  SRV["🌐 公网服务器 · frps bindPort 7000<br/>同端口自动识别 TCP / TLS / WS / WSS"]
+  CORE["frp v0.71.0 控制面<br/>yamux + 工作连接池 · 内嵌面板（真实 IP / 归属地 / 流量）"]
+  USER["💻 外部访问者<br/>remotePort 或 stcp visitor"]
 
-  APP <--> FRPC
-  IP4P -.->|"覆盖拨号目标"| FRPC
-  FRPC -->|"wss / quic / tls / tcp"| CDN
-  FRPC -->|"直连"| PORT
-  CDN -.->|"HTTPS 回源"| PORT
-  PORT --> CORE
-  CORE --> PANEL
+  LAN -->|"wss / quic / tls / tcp 直连"| SRV
+  LAN -.->|"经过 CDN"| EDGE
+  EDGE -.->|"HTTPS 回源"| SRV
+  SRV --> CORE
   USER -->|"访问公网端口或 stcp"| CORE
-  CORE <-->|"隧道内字节原样往返"| FRPC
 ```
 
 > 图里最关键的一点：**WSS、IP4P、CDN 适配都不要改 `frps.toml`**。服务端按连接内容
-> 自动判定协议，客户端只改官方本来就有的 `transport.protocol = "wss"` 一行。
+> 自动判定协议，客户端只改官方本来就有的 `transport.protocol = "wss"` 一行；
+> 隧道建立后，内网服务与外部访问者之间的字节在 frpc ↔ frps 之间原样往返。
 
 | 需求 | 实现 |
 |---|---|
@@ -177,18 +165,13 @@ auth.token = "..."
 | 3 | 回退 | 无匹配记录 ⇒ 原样使用 `serverAddr` + `serverPort`，与官方行为一致 |
 
 ```mermaid
-flowchart LR
-  A["serverAddr"] --> B{"是 IP 字面量?"}
-  B -->|"是"| Z["直接拨号<br/>零 DNS 开销"]
-  B -->|"否 · 域名"| C["① 查 TXT"]
-  C -->|"base64 / 明文 IPv4:端口"| D["目标 = 203.0.113.7:18246"]
-  C -->|"未命中"| E["② 查 AAAA"]
-  E -->|"2001:0000::/16"| F["从 IPv6 字节解出 IPv4 + 端口"]
-  E -->|"未命中"| G["③ 回退<br/>原样 serverAddr + serverPort"]
-  D --> H["覆盖拨号目标"]
-  F --> H
-  G --> H
-  Z --> H
+flowchart TB
+  A["① serverAddr 是 IP 字面量?<br/>是 → 直接拨号，零 DNS 开销"]
+  B["② 否 → 查 TXT<br/>base64 / 明文 IPv4:端口，命中即返回"]
+  C["③ TXT 未命中 → 查 AAAA<br/>2001:0000::/16 里解出 IPv4 + 端口"]
+  D["④ 都没命中 → 回退<br/>原样 serverAddr + serverPort，与官方一致"]
+  E["结果：覆盖拨号目标"]
+  A --> B --> C --> D --> E
 ```
 
 日志示例：
