@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="250" viewBox="0 0 800 250" role="img">
+<title>frps 与 frpc 整体拓扑</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#57606a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="0" y="0" width="800" height="250" rx="12" fill="#ffffff"/>
+<rect x="20" y="45" width="225" height="84" rx="10" fill="#f6f8fa" stroke="#185FA5" stroke-width="1.5"/>
+<rect x="20" y="45" width="5" height="84" rx="2" fill="#185FA5"/>
+<text x="132" y="78.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="600" fill="#1f2328">内网 frpc</text>
+<text x="132" y="101.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">RDP / SSH / Web</text>
+<rect x="288" y="45" width="225" height="84" rx="10" fill="#f6f8fa" stroke="#185FA5" stroke-width="1.5" stroke-dasharray="5 4"/>
+<rect x="288" y="45" width="5" height="84" rx="2" fill="#185FA5"/>
+<text x="400" y="78.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="600" fill="#1f2328">可选：CDN / WAF</text>
+<text x="400" y="101.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">IP4P 覆盖拨号目标</text>
+<rect x="556" y="45" width="225" height="84" rx="10" fill="#f6f8fa" stroke="#0F6E56" stroke-width="1.5"/>
+<rect x="556" y="45" width="5" height="84" rx="2" fill="#0F6E56"/>
+<text x="668" y="78.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="600" fill="#1f2328">frps 同端口 7000</text>
+<text x="668" y="101.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">TCP / TLS / WS / WSS</text>
+<path d="M248 87 L284 87" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
+<path d="M516 87 L552 87" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
+<text x="400" y="170" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">外部访问者通过 remotePort 或 stcp 接入；隧道内字节原样往返</text>
+<text x="400" y="200" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">WSS、IP4P、CDN 适配均无需修改 frps.toml</text>
+</svg>

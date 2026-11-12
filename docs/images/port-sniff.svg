@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="300" viewBox="0 0 800 300" role="img">
+<title>bindPort 同端口两级嗅探</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#57606a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="0" y="0" width="800" height="300" rx="12" fill="#ffffff"/>
+<rect x="20" y="30" width="350" height="80" rx="10" fill="#f6f8fa" stroke="#185FA5" stroke-width="1.5"/>
+<rect x="20" y="30" width="5" height="80" rx="2" fill="#185FA5"/>
+<text x="195" y="61.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="600" fill="#1f2328">1. 明文层判 HTTP</text>
+<text x="195" y="84.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">WS 升级 → 明文 WebSocket</text>
+<rect x="430" y="30" width="350" height="80" rx="10" fill="#f6f8fa" stroke="#185FA5" stroke-width="1.5"/>
+<rect x="430" y="30" width="5" height="80" rx="2" fill="#185FA5"/>
+<text x="605" y="61.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="600" fill="#1f2328">2. 普通 HTTP</text>
+<text x="605" y="84.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">回 HTTP 200（CDN 健康检查）</text>
+<rect x="20" y="160" width="350" height="80" rx="10" fill="#f6f8fa" stroke="#0F6E56" stroke-width="1.5"/>
+<rect x="20" y="160" width="5" height="80" rx="2" fill="#0F6E56"/>
+<text x="195" y="191.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="600" fill="#1f2328">3. 否则 TLS 协商</text>
+<text x="195" y="214.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">解密后再判一次 WS</text>
+<rect x="430" y="160" width="350" height="80" rx="10" fill="#f6f8fa" stroke="#0F6E56" stroke-width="1.5"/>
+<rect x="430" y="160" width="5" height="80" rx="2" fill="#0F6E56"/>
+<text x="605" y="191.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="16" font-weight="600" fill="#1f2328">4. 结果</text>
+<text x="605" y="214.0" text-anchor="middle" dominant-baseline="central" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">WSS 或字节回放 → 原生 frp</text>
+<path d="M373 70 L426 70" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
+<path d="M195 113 L195 156" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
+<path d="M605 113 L605 156" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
+<path d="M373 200 L426 200" fill="none" stroke="#57606a" stroke-width="1.8" marker-end="url(#ar)"/>
+<text x="400" y="275" text-anchor="middle" font-family="system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif" font-size="13" fill="#57606a">四条路径最终汇入同一套 yamux + frp 控制流程；路径不限，安全由 token 把守</text>
+</svg>

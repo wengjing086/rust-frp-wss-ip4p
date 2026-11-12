@@ -10,25 +10,11 @@
 配置文件与官方 frp 完全保持一致，服务端同端口原生支持 WSS，客户端支持 IP4P，
 并针对 Windows 安全软件的误报做了合规处理。
 
-先看一眼它长什么样 —— 左边是没公网 IP 的内网，右边是公网上的 frps：
+先看一眼它长什么样（静态图，尺寸固定，不依赖页面渲染器）：
 
-```mermaid
-flowchart TB
-  LAN["内网 frpc"]
-  EDGE["可选：CDN / WAF · IP4P"]
-  SRV["frps 同端口 7000"]
-  CORE["frp 控制面 · 工作连接池"]
-  PANEL["内嵌面板 · 流量统计"]
-  USER["外部访问者"]
-  LAN -->|"wss 等"| SRV
-  LAN -.->|"可选"| EDGE
-  EDGE -.->|"回源"| SRV
-  SRV --> CORE
-  CORE --> PANEL
-  USER -->|"访问"| CORE
-```
+![整体拓扑：内网 frpc 经可选 CDN 连到 frps 同端口](docs/images/overview.svg)
 
-> 从上到下：内网的 RDP / SSH / Web 接到 frpc，可经 CDN / WAF（路径任意）或直连公网；
+> 从左到右：内网的 RDP / SSH / Web 接到 frpc，可经 CDN / WAF（路径任意）或直连公网；
 > frps 在 `bindPort` 上自动识别 TCP / TLS / WS / WSS，之后是 frp 控制面与内嵌面板
 > （真实 IP、归属地、流量）；外部访问者通过 remotePort 或 stcp 接入，隧道内字节原样往返。
 > **WSS、IP4P、CDN 适配都不要改 `frps.toml`**，客户端只加官方本来就有的
@@ -80,24 +66,14 @@ frps -c frps.toml
 `bindPort` 现在会**自动**同时接受 `tcp` / `tls` / `websocket` / `wss`，
 靠的是两级嗅探 —— 明文层判一次，TLS 解密后再判一次：
 
-```mermaid
-flowchart TD
-  A["新连接到 bindPort"] --> B{"像 HTTP 请求?"}
-  B -->|"WS 升级"| C["明文 WebSocket"]
-  B -->|"普通 HTTP"| D["回 HTTP 200"]
-  B -->|"否"| E["TLS 协商"]
-  E --> F{"解密后仍是 WS?"}
-  F -->|"是"| G["WSS 升级"]
-  F -->|"否"| H["回放字节 · 原生 frp"]
-  C --> I["同一套 yamux 控制面"]
-  G --> I
-  H --> I
-```
+![bindPort 同端口两级嗅探的四个分支](docs/images/port-sniff.svg)
 
 判据是「**是不是一条合法的 WebSocket 升级请求**」，不是固定路径 `GET /~!frp`，
 所以放在 CDN / WAF 后面可以把路径换成任意正常业务路径；安全边界由 token 认证把守，
-不靠路径保密。官方 frps 只在 TLS **之前**嗅探，所以 `wss` 连它必须前置 nginx
-终结 TLS —— 本项目省掉的正是这一层。
+不靠路径保密。普通 HTTP 请求（含 CDN 回源健康检查）回一个最小 HTTP 200 响应；
+TLS 分支没命中 WS 时把 peek 到的字节**无损回放**，继续按原生 frp over TLS / TCP 处理。
+四条路径最终汇入同一套 yamux + frp 控制流程。官方 frps 只在 TLS **之前**嗅探，
+所以 `wss` 连它必须前置 nginx 终结 TLS —— 本项目省掉的正是这一层。
 
 ### 2. 客户端
 
@@ -167,15 +143,7 @@ auth.token = "..."
 | 2 | AAAA | IP4P 编码 IPv6（`2001:0000::/16`），端口在字节 10–11，IPv4 在字节 12–15 |
 | 3 | 回退 | 无匹配记录 ⇒ 原样使用 `serverAddr` + `serverPort`，与官方行为一致 |
 
-```mermaid
-flowchart TB
-  A["1. IP 字面量 · 直拨"]
-  B["2. 查 TXT"]
-  C["3. 查 AAAA"]
-  D["4. 都未命中 · 回退"]
-  E["覆盖拨号目标"]
-  A --> B --> C --> D --> E
-```
+![IP4P 解析顺序：IP 字面量、TXT、AAAA、回退](docs/images/ip4p-flow.svg)
 
 日志示例：
 
