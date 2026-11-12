@@ -54,6 +54,37 @@ tcp_mux = true
 #   取值会被夹在 [1, 65507]。
 # udpPacketSize = 1500
 
+# ---- 数据面压缩（省带宽，但要看内容类型）----
+# 对应官方 `[proxies.transport].useCompression`，算法是 **Snappy framing**（与官方逐字节兼容）。
+# 可以只给某条代理开，也可以写成客户端级：
+#   [transport]
+#   useCompression = true        # 对本客户端所有代理生效
+#
+# ★ 实测效果（v0.8.7，单条 HTTP 代理，1 MB 文件回源）：
+#   类 HTML 文本   957 KB → 255 KB   3.75x   ← 值得开
+#   JSON 小响应    832 B  → 362 B    2.30x   ← 值得开
+#   随机/图片     1 MB   → 1 MB      1.00x   ← 白费 CPU，还会大 0.012%
+#   HTTP 头 194 B        → 179 B     1.08x   ← 太小，收益接近零
+#   单个 512 B 包        → 520 B     0.98x   ← **反而变大**
+#
+# 结论：
+#   * 文本 / JSON / 日志 / 源码 / SQL 结果  → 开，能省一半以上
+#   * 图片 / 视频 / zip / 已 gzip 的响应   → 别开，压不动还占 CPU
+#   * 大量几百字节的小包                   → 别开，每块 8 B 的头比省下来的多
+#
+# ★ 例外（重要）：如果是 **HTTP/HTTPS 站点**代理，优先让**源站**开 gzip/brotli，
+#   而不是在这里开 useCompression。理由：
+#     1) 源站能按 Content-Type 精确分流，图片不会被二次压缩；
+#     2) brotli 对 HTML/JS/CSS 比 snappy 好一大截（实测 32 KB HTML：snappy 11.4 KB
+#        vs brotli 2.8 KB）；
+#     3) CDN / 浏览器直接认 Content-Encoding，CDN 还能缓存压好的版本，
+#        回源流量一并省掉 —— 这是 frp 层压缩做不到的。
+#   源站已经 gzip 过的话，这里再开 snappy 基本是「压不动」：
+#   实测 HTML 14 KB → gzip 后 5.9 KB → 再 snappy 仍是 5.9 KB。
+#
+# 代价：压缩是逐字节同步做的，会吃一点 CPU；不影响握手延迟。
+# useCompression = true
+
 # TLS 加密传输（对应 frp 的 transport.tls.enable）
 # 与 frp 行为一致：默认不校验服务端证书，服务端用自签名证书即可
 tls_enable = false
