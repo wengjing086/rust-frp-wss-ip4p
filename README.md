@@ -581,7 +581,7 @@ allowPorts = ["20000-40000"]
 | legacy `frpc.ini` 里的 `tcpmux` | 旧 INI 解析路径不支持该类型，会报错而非静默降级。**TOML 配置路径的 tcpmux 是支持的**，上面的互通矩阵标 ✅ 指的是 TOML。 |
 | OIDC discovery 遇到 302 | 内置 HTTP 客户端不支持 HTTP/2、重定向、cookie。个别 IdP 的 discovery 文档会 302，请把 `tokenEndpointURL` / `issuer` 直接写成最终地址。 |
 | `protocol = "nfrp"` 之类的自研协议 | 尚未实现，配置选到会直接报错；请用 `frp-v1`（默认）或 `frp-v2`。 |
-| Windows ARM64 二进制 | 构建需要 clang + gnullvm，当前环境缺 clang，v0.8.6 / v0.8.7 未提供；以 Release 的 `SHA256SUMS.txt` 实际列出的文件为准。 |
+| Windows ARM64 二进制 | 构建需要 clang + gnullvm，当前构建环境缺 clang，**自 v0.8.6 起各版均未提供**；以 Release 的 `SHA256SUMS.txt` 实际列出的文件为准。 |
 
 跨实现实测细节见 `_interop/compat_go.py`（41 项用例，可自行复跑）。
 
