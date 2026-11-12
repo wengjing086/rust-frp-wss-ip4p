@@ -160,5 +160,31 @@ s += [T(400, 252, 'serverAddr 为 IP 字面量时完全跳过 DNS 探测，零�
 s.append('</svg>')
 (OUT / 'ip4p-flow.svg').write_text('\n'.join(s), encoding='utf-8')
 
+# ---------------- 图 4：CDN 回源证书归属 ----------------
+s = head(800, 262, 'CDN 回源：证书属于哪一段', '只有 HTTPS 回源才需要给 frps 配证书')
+
+# 左卡：frpc → CDN
+s += [R(16, 52, 380, 122, '#eef5fc', '#c9dcf0', 12, 1.2),
+      T(32, 74, '① frpc → CDN 边缘', 12.5, BLUE, 600, 'start')]
+s += pill(32, 86, 42, 'TLS', TEAL)
+s += [T(84, 100, '客户端与 CDN 之间始终是 TLS', 11.5, MUTED, 400, 'start'),
+      T(32, 128, '证书：CDN 的加速域名证书', 11.5, INK, 500, 'start'),
+      T(32, 150, 'frps 不用配，客户端也不用配', 11.5, MUTED, 400, 'start')]
+
+# 右卡：CDN → frps
+s += [R(404, 52, 380, 122, '#e8f5f0', '#b8ddd0', 12, 1.2),
+      T(420, 74, '② CDN → frps 源站', 12.5, TEAL, 600, 'start')]
+s += pill(420, 84, 54, 'HTTP', AMBER)
+s += pill(482, 84, 62, 'HTTPS', TEAL)
+s += [T(420, 128, 'HTTP：无 TLS，frps 不用证书', 11.5, MUTED, 400, 'start'),
+      T(420, 150, 'HTTPS：TLS，证书只能由 frps 提供', 11.5, TEAL, 600, 'start')]
+
+# 底部：不配证书的后果
+s += [R(16, 188, 768, 58, '#fff7e8', '#e8c98a', 9, 1.1),
+      T(400, 210, '不配证书：frps 退回内置自签（CN=rcgen，SAN=frp）→ 对端 error 18', 12, INK, 500),
+      T(400, 232, '证书域名不符 → error 62 hostname mismatch　·　配对 → Verify return code: 0 (ok)', 11.5, MUTED)]
+s.append('</svg>')
+(OUT / 'cdn-tls.svg').write_text('\n'.join(s), encoding='utf-8')
+
 for f in sorted(OUT.glob('*.svg')):
     print(f.name, f.stat().st_size, 'bytes')

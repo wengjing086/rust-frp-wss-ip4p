@@ -269,6 +269,8 @@ verifyServerCert = true           # CDN 用的是正规证书，建议开启校�
 | CDN → frps（**HTTP 回源**） | 这一段没有 TLS | 不要 |
 | CDN → frps（**HTTPS 回源**） | **只能由 frps 提供** | **必须配** |
 
+![CDN 两段链路的证书归属：段① 用 CDN 的证书，段② 只有 HTTPS 回源才需要 frps 证书](images/cdn-tls.svg)
+
 也就是说：**用了 CDN 不等于要给 frps 配证书**，只有当你把回源协议选成 HTTPS 时才是。
 反过来说，一旦选了 HTTPS 回源又不配证书，frps 会退回启动时自动生成的自签证书 ——
 而那张证书是给「客户端不校验」的场景用的，CDN 一校验就必然失败。

@@ -327,6 +327,8 @@ serverName = "frps.example.com"
 | CDN → frps（**HTTP 回源**） | 这一段没有 TLS | 不要 |
 | CDN → frps（**HTTPS 回源**） | 只能由 frps 提供 | **必须配** |
 
+![CDN 两段链路的证书归属：段① 用 CDN 的证书，段② 只有 HTTPS 回源才需要 frps 证书](docs/images/cdn-tls.svg)
+
 **frps.toml —— HTTP 回源**（建议先用它跑通，完整版 [assets/frps.cdn.toml](assets/frps.cdn.toml)）
 
 ```toml

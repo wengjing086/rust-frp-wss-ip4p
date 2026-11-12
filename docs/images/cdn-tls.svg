@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="262" viewBox="0 0 800 262" role="img">
+<title>CDN 回源：证书属于哪一段</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#57606a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect x="0" y="0" width="800" height="262" rx="12" fill="#ffffff" stroke="#ffffff" stroke-width="0"/>
+<text x="20" y="27" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328">CDN 回源：证书属于哪一段</text>
+<text x="780" y="27" text-anchor="end" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">只有 HTTPS 回源才需要给 frps 配证书</text>
+<path d="M20 39 L780 39" stroke="#d8dee4" stroke-width="1" fill="none"/>
+<rect x="16" y="52" width="380" height="122" rx="12" fill="#eef5fc" stroke="#c9dcf0" stroke-width="1.2"/>
+<text x="32" y="74" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="600" fill="#185FA5">① frpc → CDN 边缘</text>
+<rect x="32" y="86" width="42" height="22" rx="11" fill="#0F6E56" stroke="#0F6E56" stroke-width="0.6"/>
+<text x="53.0" y="101" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11" font-weight="600" fill="#ffffff">TLS</text>
+<text x="84" y="100" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">客户端与 CDN 之间始终是 TLS</text>
+<text x="32" y="128" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="500" fill="#1f2328">证书：CDN 的加速域名证书</text>
+<text x="32" y="150" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">frps 不用配，客户端也不用配</text>
+<rect x="404" y="52" width="380" height="122" rx="12" fill="#e8f5f0" stroke="#b8ddd0" stroke-width="1.2"/>
+<text x="420" y="74" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="600" fill="#0F6E56">② CDN → frps 源站</text>
+<rect x="420" y="84" width="54" height="22" rx="11" fill="#BA7517" stroke="#BA7517" stroke-width="0.6"/>
+<text x="447.0" y="99" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11" font-weight="600" fill="#ffffff">HTTP</text>
+<rect x="482" y="84" width="62" height="22" rx="11" fill="#0F6E56" stroke="#0F6E56" stroke-width="0.6"/>
+<text x="513.0" y="99" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11" font-weight="600" fill="#ffffff">HTTPS</text>
+<text x="420" y="128" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">HTTP：无 TLS，frps 不用证书</text>
+<text x="420" y="150" text-anchor="start" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="600" fill="#0F6E56">HTTPS：TLS，证书只能由 frps 提供</text>
+<rect x="16" y="188" width="768" height="58" rx="9" fill="#fff7e8" stroke="#e8c98a" stroke-width="1.1"/>
+<text x="400" y="210" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="12" font-weight="500" fill="#1f2328">不配证书：frps 退回内置自签（CN=rcgen，SAN=frp）→ 对端 error 18</text>
+<text x="400" y="232" text-anchor="middle" font-family="system-ui,-apple-system,'Segoe UI','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="400" fill="#57606a">证书域名不符 → error 62 hostname mismatch　·　配对 → Verify return code: 0 (ok)</text>
+</svg>
