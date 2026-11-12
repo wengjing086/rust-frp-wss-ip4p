@@ -1,0 +1,65 @@
+# ============================================================
+# frps.toml —— 放在 CDN / WAF 后面（HTTPS 回源，必须配证书）
+#
+# 用法：  frps -c frps.cdn-https.toml
+# 预检：  frps --check -c frps.cdn-https.toml   # 证书能否装载会在这里就暴露
+# 成对：  assets/frpc.cdn.toml
+# 原理：  docs/CDN.md
+#
+# 这一份对应 CDN 控制台里「回源协议 = HTTPS」。
+# CDN 到源站这一段也走 TLS，而**源站证书只能由 frps 提供** ——
+# 不配证书时 frps 会用启动时生成的自签证书（SAN 固定为 "frp"），
+# CDN 校验必然失败，表现为 521 / 525 / ssl_handshake_failure。
+#
+# 证书从哪来：正式 CA、云厂商免费证书、Let's Encrypt 都行，
+# 唯一要求是**域名能对上 CDN 回源时用的 SNI / Host**。
+# ============================================================
+
+# ⚠ TOML 规则：[表头] 之后的所有裸键都会归属那张表。
+#   下面这些都是**顶层键**，必须写在任何 [表头] 之前，否则会被静默忽略。
+
+bindAddr = "::"          # IPv6 回源必须写 "::"；只走 IPv4 写 "0.0.0.0"
+bindPort = 7000          # 与 CDN「源站端口」一致；HTTPS 回源也填这个端口
+trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12"]   # CDN 回源网段，用于还原真实 IP
+ipgeo = true
+allowPorts = ["20000-30000"]
+
+
+# ---- 以下为表头，必须放在所有顶层键之后 ----
+
+[auth]
+method = "token"
+token = "换成至少 16 位的随机强令牌"
+
+[transport.tls]
+certFile = "/etc/nfrp/certs/fullchain.pem"
+keyFile = "/etc/nfrp/certs/privkey.pem"
+
+# certFile 必须是 **fullchain**（服务器证书 + 中间证书），只有叶子证书时
+# 部分 CDN 会报「证书链不完整」。
+#
+# 三条硬性要求：
+#   1. certFile 与 keyFile 必须同时配置。只配一个 → frps **直接启动失败**：
+#      `transport.tls.certFile 与 keyFile 必须同时配置（当前只配了一个）`
+#   2. 证书里的域名必须覆盖 CDN 回源使用的 SNI / Host（一般就是加速域名）
+#   3. 路径用绝对路径；私钥建议 chmod 600
+#
+# 改证书后必须**重启** frps，不能热重载：
+#   rustls 的服务端配置是进程全局的，源码会明确拒绝中途换证书
+#   （`本进程内不能热切换证书`）。
+#
+# 自签也能用，但**只在这两种情况下**：
+#   * CDN 控制台关闭了「校验源站证书」；
+#   * 或把自签 CA 传到了 CDN 的自定义证书链里。
+# 自签证书的域名必须自己签成加速域名，不能沿用 frps 内置那张（SAN = "frp"）。
+
+# 可选：mTLS —— 要求 CDN 也出示客户端证书。
+# 多数 CDN 的 HTTPS 回源不提供客户端证书，开了会直接握手失败，一般不要配。
+# trustedCaFile = "/etc/nfrp/certs/client-ca.pem"
+
+# 可选：面板（同样建议只听回环，且不要挂到加速域名后面）
+# [webServer]
+# addr = "127.0.0.1"
+# port = 7500
+# user = "admin"
+# password = "换成强密码"

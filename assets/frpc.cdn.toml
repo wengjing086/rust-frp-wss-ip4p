@@ -1,0 +1,49 @@
+# ============================================================
+# frpc.toml —— 经 CDN / WAF 连到 frps
+#
+# 用法：  frpc -c frpc.cdn.toml
+# 成对：  assets/frps.cdn.toml（HTTP 回源）或 assets/frps.cdn-https.toml（HTTPS 回源）
+# 原理：  docs/CDN.md
+# ============================================================
+
+serverAddr = "frps.example.com"
+# 填 **CDN 加速域名**，不要填源站 IP。
+# 写成 IP 时 SNI / Host / Origin 都会变成 IP，CDN 找不到站点，直接 403 / 502。
+# 真要用 IP 访问，必须显式配下面的 serverName。
+
+serverPort = 443
+# CDN 对外的 HTTPS 端口。不是源站的 7000 —— 7000 只对 CDN 回源可见。
+
+[auth]
+method = "token"
+token = "与 frps 完全一致的强令牌"
+
+[transport]
+protocol = "wss"
+# TLS 内的 WebSocket。CDN 只认 HTTP(S) 流量，裸 TCP 一定会被丢。
+# wss 已包含 TLS，不需要再写 [transport.tls] enable = true。
+# 想让 CDN 看不到 frp 内容，可再加 tls.enable = true ——
+# 那是 WS 帧之内的第二层加密，与外层 CDN TLS 互不冲突。
+
+[transport.tls]
+serverName = "frps.example.com"
+# TLS SNI + HTTP Host + Origin 都取它，必须与 CDN 加速域名一致。
+
+verifyServerCert = true
+# 连 CDN 时建议 **true**：边缘用的是正规证书，能真正验证「对面是 CDN」。
+# 例外：CDN 用了私有 CA、或运行环境缺根证书，握手会报证书错误 ——
+# 此时把该 CA 填进 trustedCaFile，或退回 false（等于不校验，仅防窃听）。
+
+# ⚠ 不要写 [transport.websocket] path。
+#   服务端判定只看请求行与 Upgrade 头，不比较路径，改它不解决任何问题：
+#   * 403 的真因是缺 Origin —— 0.8.1 起客户端已自动补；
+#   * 520 的真因是源站健康检查没拿到 HTTP 200 —— 升级 frps / 修 bindAddr。
+
+[[proxies]]
+name = "ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 22022
+# remotePort 必须落在 frps 的 allowPorts 白名单内。
+# 隧道建好之后，访问者是直连 frps 的 22022，不经过 CDN。

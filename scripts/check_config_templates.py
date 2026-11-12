@@ -71,8 +71,9 @@ def main():
     targets = []
     for rel in ["README.md", "docs/CONFIG.md"]:
         targets.append((rel, blocks_from_markdown(ROOT / rel)))
-    for rel in ["assets/frps.toml", "assets/frpc.toml"]:
-        targets.append((rel, [(1, (ROOT / rel).read_text(encoding="utf-8"))]))
+    for path in sorted((ROOT / "assets").glob("*.toml")):
+        rel = str(path.relative_to(ROOT)).replace("\\", "/")
+        targets.append((rel, [(1, path.read_text(encoding="utf-8"))]))
 
     total = bad = 0
     for rel, blocks in targets:

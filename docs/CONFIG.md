@@ -419,6 +419,8 @@ reconnectInterval = 10
 
 ## 10. IP4P 与 CDN 回源
 
+### 10.1 IP4P（frpc 侧）
+
 ```toml
 # frpc.toml：无需任何新增键，serverAddr 填发布 IP4P 记录的域名即可
 serverAddr = "your.ip4p.example.com"
@@ -426,25 +428,113 @@ serverAddr = "your.ip4p.example.com"
 dnsServer = "223.5.5.5"          # 可选：指定 DNS 服务器
 ```
 
-```toml
-# frps.toml：CDN 回源时采信 X-Forwarded-For（默认空 = 永不采信）
-trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12"]
-ipgeo = true                     # 面板显示国内归属地；可关或 NFRP_IPGEO=0
-```
+### 10.2 CDN / WAF 回源 · HTTP 回源（frps 不需要证书）
+
+CDN 控制台「回源协议」选 **HTTP** 时用这一对。CDN 边缘终结客户端 TLS，
+到源站走明文 HTTP，所以 **frps 侧没有任何证书要配**。
+
+**frps.toml** —— 完整可用，等同 [`assets/frps.cdn.toml`](../assets/frps.cdn.toml)
 
 ```toml
-# frpc.toml：放在 CDN / WAF 后面（详见 CDN.md）
-serverAddr = "frps.example.com"
-serverPort = 443
+# ⚠ 顶层键必须写在所有 [表头] 之前，否则会被 TOML 归入上一张表、静默失效
+bindAddr = "::"                  # IPv6 回源必须 "::"；只走 IPv4 写 "0.0.0.0"
+bindPort = 7000                  # 与 CDN 的「源站端口」一致
+trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12"]   # CDN 回源网段，还原真实 IP
+ipgeo = true                     # 可选：面板显示归属地；NFRP_IPGEO=0 可关
+allowPorts = ["20000-30000"]     # 建议：限制隧道能申请的公网端口
+
+[auth]
+method = "token"
+token = "换成至少 16 位的随机强令牌"
+```
+
+**frpc.toml** —— 完整可用，等同 [`assets/frpc.cdn.toml`](../assets/frpc.cdn.toml)
+
+```toml
+serverAddr = "frps.example.com"  # CDN 加速域名，不要填源站 IP
+serverPort = 443                 # CDN 对外 HTTPS 端口
+
+[auth]
+method = "token"
+token = "与 frps 完全一致"
+
 [transport]
-protocol = "wss"
+protocol = "wss"                 # CDN 只认 HTTP(S)；wss 已含 TLS
+
 [transport.tls]
-serverName = "frps.example.com"
-verifyServerCert = false
+serverName = "frps.example.com"  # TLS SNI + HTTP Host + Origin 都取它
+verifyServerCert = true          # 连 CDN 的正规证书，建议开启校验
+
+[[proxies]]
+name = "ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 22022               # 必须落在 frps 的 allowPorts 内
 ```
 
-> **不需要配置 `websocket.path`**：服务端按合法 WS 升级请求判定，不比较路径；
-> 403 的真因是缺 `Origin`（客户端已自动带），完整原理与排障见 [CDN.md](CDN.md)。
+> **不需要配 `websocket.path`**：服务端按合法 WS 升级请求判定，不比较路径；
+> 403 的真因是缺 `Origin`（0.8.1 起客户端自动补），520 是源站健康检查没拿到 200。
+
+### 10.3 CDN / WAF 回源 · HTTPS 回源（frps 必须配证书）
+
+CDN 控制台「回源协议」选 **HTTPS** 时，CDN 到源站这一段也要 TLS，
+而**源站证书只能由 frps 提供**。此时在 10.2 的模板基础上追加：
+
+```toml
+# 追加到 frps.cdn.toml 末尾（[transport.tls] 是表头，不能写在顶层键之前）
+[transport.tls]
+certFile = "/etc/nfrp/certs/fullchain.pem"   # 必须是 fullchain（含中间证书）
+keyFile = "/etc/nfrp/certs/privkey.pem"
+```
+
+三条硬性要求：
+
+1. `certFile` 与 `keyFile` **必须同时配置**，只配一个 frps 直接启动失败；
+2. 证书域名必须覆盖 CDN 回源用的 **SNI / Host**（一般就是加速域名）；
+3. `certFile` 用 fullchain，只有叶子证书会被部分 CDN 判「链不完整」。
+
+**不配会怎样**（实测，详见 [CDN.md §5.4](CDN.md)）：
+
+| 情形 | 对端结果 | CDN 侧表现 |
+|---|---|---|
+| 不配证书 | frps 出示内置自签（`CN=rcgen`、SAN 固定 `frp`），对端报 `error 18: self-signed certificate` | 521 / 525 / 526 或 `ssl_handshake_failure` |
+| 配了证书但域名不符 | `error 62: hostname mismatch` | 同上 |
+| 配了证书且域名正确 | `Verify return code: 0 (ok)` | 正常 |
+| 不配证书 + CDN 关闭「校验源站证书」 | 能握手，但等于不验证源站身份 | 能用，安全性打折 |
+
+> 还有一个常被忽略的点：**HTTP 回源时 CDN→源站是明文**，token 在回源段可被嗅探。
+> 要盖住这一段，只能用 HTTPS 回源 + 证书。
+
+**自签只在两种情况下可用**：CDN 关闭「校验源站证书」，或把自签 CA 上传到 CDN 的
+自定义证书链。自签时要自己签一张把加速域名写进 SAN 的证书，**不能沿用 frps 内置那张**。
+
+**换证书必须重启 frps**，不能热重载（rustls 配置是进程全局的，源码会拒绝中途更换）；
+Let's Encrypt 续期后记得挂 `reload-or-restart frps` 的钩子。
+
+### 10.4 这份模板里不要出现的东西
+
+| 不要写 | 原因 |
+|---|---|
+| `[transport] protocol = "wss"`（frps 侧） | 服务端在 `bindPort` 上按连接内容自动判定 tcp/tls/ws/wss，没有协议开关 |
+| `[transport.websocket] path` | 服务端不比较路径，改它不解决任何问题 |
+| CDN 的 Host / SNI / 回源协议 | 那些是 **CDN 控制台**的设置，不是 frps 配置 |
+| QUIC 作为回源方式 | QUIC 固定用自签证书（内部名 `nfrp.frp`）、无法换正式证书，HTTP CDN 也不代理它 |
+
+改完先预检再重启，证书类错误会在这里直接暴露，不会拖到握手阶段：
+
+```bash
+frps --check -c frps.cdn-https.toml
+```
+
+### 10.5 成对模板文件
+
+| 场景 | frps | frpc |
+|---|---|---|
+| CDN / WAF · HTTP 回源 | [assets/frps.cdn.toml](../assets/frps.cdn.toml) | [assets/frpc.cdn.toml](../assets/frpc.cdn.toml) |
+| CDN / WAF · HTTPS 回源 | [assets/frps.cdn-https.toml](../assets/frps.cdn-https.toml) | 同上 |
+
+完整原理、CDN 控制台逐项设置与排障矩阵见 [CDN.md](CDN.md)。
 
 ---
 
@@ -553,7 +643,11 @@ mtu = 1400
 |---|---|
 | 服务端全量注释模板 | [assets/frps.toml](../assets/frps.toml) |
 | 客户端全量注释模板 | [assets/frpc.toml](../assets/frpc.toml) |
+| **CDN 回源 · frps（HTTP 回源，无证书）** | [assets/frps.cdn.toml](../assets/frps.cdn.toml) |
+| **CDN 回源 · frps（HTTPS 回源，配证书）** | [assets/frps.cdn-https.toml](../assets/frps.cdn-https.toml) |
+| **CDN 回源 · frpc（两份共用）** | [assets/frpc.cdn.toml](../assets/frpc.cdn.toml) |
 | 命令行生成 | `frps --gen-config frps.toml` / `frpc --gen-config frpc.toml` |
+| 配置预检（含证书能否装载） | `frps --check -c frps.toml` |
 | CDN 原理与部署 | [CDN.md](CDN.md) |
 | WSS 传输层原理 | [WSS.md](WSS.md) |
 | IP4P 记录格式 | [IP4P.md](IP4P.md) |

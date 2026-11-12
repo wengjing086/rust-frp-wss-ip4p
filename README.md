@@ -249,7 +249,7 @@ remotePort = 6022
 | 面板、指标、本地管理 | `[webServer]` + `enablePrometheus` | `[webServer]` / `[store]` | §7 |
 | 端口白名单与资源上限 | `allowPorts` / `max_total_conns` / `[acl]` / `[[roles]]` | — | §8 |
 | 日志、热重载、拆分配置 | `[log]` / `hot_reload` | `[log]` / `includes` / `loginFailExit` | §9 |
-| IP4P 与 CDN 回源 | `trusted_proxies` / `ipgeo` | `serverAddr` 填 IP4P 域名 / `protocol = "wss"` | §10 |
+| IP4P 与 CDN 回源 | `trusted_proxies` / `ipgeo` / `allowPorts`；HTTPS 回源再加 `[transport.tls]` 证书 | `serverAddr` 填 IP4P 域名或 CDN 加速域名 / `protocol = "wss"` | §10 |
 | 插件（正向代理 / 静态站点） | — | `plugin` + `plugin_*` 字段 | §11 |
 | group 均衡 / 健康检查 / 限流 | `lb_policy` | `group_key` / `health_check_*` / `bandwidth_limit` | §12 |
 | VirtualNet / P2P | `vnet_port` / `[vnet]` | `[virtualNet]` / `p2pPort` / `xtcp_transport` | §13 |
@@ -316,6 +316,77 @@ serverName = "frps.example.com"
 > 同一个 `bindPort` 同时接受 `tcp` / `tls` / `websocket` / `wss`，服务端按连接内容自动判定。
 > 放在 CDN / WAF 后面时**不要配 `websocket.path`**（路径不参与判定，详见
 > [docs/CDN.md](docs/CDN.md)）。
+
+### 常用片段：CDN / WAF 回源
+
+先说清**证书到底属于哪一段**——这是最容易搞混的地方：
+
+| 链路 | 证书谁提供 | frps 要配吗 |
+|---|---|---|
+| frpc → CDN 边缘 | CDN（加速域名的证书） | 不要 |
+| CDN → frps（**HTTP 回源**） | 这一段没有 TLS | 不要 |
+| CDN → frps（**HTTPS 回源**） | 只能由 frps 提供 | **必须配** |
+
+**frps.toml —— HTTP 回源**（建议先用它跑通，完整版 [assets/frps.cdn.toml](assets/frps.cdn.toml)）
+
+```toml
+# 顶层键必须写在所有 [表头] 之前
+bindAddr = "::"                  # IPv6 回源必须 "::"；只走 IPv4 写 "0.0.0.0"
+bindPort = 7000                  # 与 CDN 的「源站端口」一致
+trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12"]   # CDN 回源网段，还原真实 IP
+allowPorts = ["20000-30000"]
+
+[auth]
+method = "token"
+token = "换成至少 16 位的随机强令牌"
+```
+
+**frps.toml —— HTTPS 回源**：在上面基础上追加证书（完整版 [assets/frps.cdn-https.toml](assets/frps.cdn-https.toml)）
+
+```toml
+[transport.tls]
+certFile = "/etc/nfrp/certs/fullchain.pem"   # fullchain：服务器证书 + 中间证书
+keyFile = "/etc/nfrp/certs/privkey.pem"
+```
+
+> **不配证书会怎样**（实测）：frps 退回启动时生成的自签证书，对端看到的是
+> `CN=rcgen self signed cert`、SAN 固定为 `DNS:frp`。CDN 一校验就报
+> `error 18: self-signed certificate`，对外 521 / 525 / 526；证书域名与回源 SNI 不符
+> 则报 `error 62: hostname mismatch`。配对了是 `Verify return code: 0 (ok)`。
+>
+> 三条硬要求：`certFile` 与 `keyFile` 必须成对（只配一个 frps 直接起不来）；
+> 证书域名要覆盖 CDN 回源用的 SNI / Host；`certFile` 用 fullchain。
+> 换证书必须**重启** frps，不能热重载。
+
+**frpc.toml**（完整版 [assets/frpc.cdn.toml](assets/frpc.cdn.toml)）
+
+```toml
+serverAddr = "frps.example.com"   # 填 CDN 加速域名，不要填源站 IP
+serverPort = 443
+
+[auth]
+token = "与 frps 完全一致"
+
+[transport]
+protocol = "wss"
+
+[transport.tls]
+serverName = "frps.example.com"   # SNI + Host + Origin 都取它
+verifyServerCert = true           # 连 CDN 的正规证书，建议开启校验
+
+[[proxies]]
+name = "ssh"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 22
+remotePort = 22022                # 必须在 frps 的 allowPorts 内
+```
+
+> frps 侧**不要**写 `protocol = "wss"`，也不要写 `websocket.path`：服务端按连接内容
+> 自动判定协议，路径不参与判定。CDN 控制台的 WebSocket 开关、健康检查、回源 Host、
+> 关闭缓存这些设置，都在 CDN 侧，不在 frps.toml 里。
+> 改完先 `frps --check -c frps.cdn-https.toml` 预检（证书能否装载会在这步暴露），
+> 完整原理、控制台逐项设置与排障矩阵见 [docs/CDN.md](docs/CDN.md)。
 
 ---
 

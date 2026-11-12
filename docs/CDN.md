@@ -161,15 +161,42 @@ GET /~!frp  +Origin +UA +Protocol    →  101 Switching Protocols
 
 ### 5.1 服务端（frps）
 
-```toml
-# frps.toml —— 无需任何 CDN 专用配置
-bindAddr = "::"          # 家宽无公网 IPv4 时必须是 "::"，见第 8 节
-bindPort = 7000          # CDN 的「源站端口」填这个
-auth.method = "token"
-auth.token = "换成一个足够随机的强令牌"
+先按 CDN 的**回源协议**选模板 —— 这两份只有一处差别：要不要证书。
 
-# 可选：让面板显示真实客户端 IP（填 CDN 的回源网段）
-trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12"]
+| 回源协议 | 用哪份模板 | frps 要不要证证书 |
+|---|---|---|
+| **HTTP**（默认，推荐先用它跑通） | [`assets/frps.cdn.toml`](../assets/frps.cdn.toml) | **不要** |
+| **HTTPS**（回源段也加密） | [`assets/frps.cdn-https.toml`](../assets/frps.cdn-https.toml) | **必须**，见 5.4 |
+
+HTTP 回源的完整模板（可直接复制运行）：
+
+```toml
+bindAddr = "::"          # 家宽无公网 IPv4、CDN 走 IPv6 回源时必须是 "::"，见第 8 节
+bindPort = 7000          # CDN 的「源站端口」填这个
+trusted_proxies = ["10.0.0.0/8", "172.16.0.0/12"]   # CDN 回源网段，用于还原真实 IP
+ipgeo = true             # 可选：面板显示归属地
+allowPorts = ["20000-30000"]                        # 建议：限制隧道可申请的公网端口
+
+[auth]
+method = "token"
+token = "换成一个足够随机的强令牌"
+```
+
+> **顺序很重要**：`bindAddr` / `bindPort` / `trusted_proxies` 这些都是**顶层键**，
+> 必须写在 `[auth]` 这类表头之前。TOML 里表头之后的所有裸键都会归入那张表，
+> 语法合法但会被 serde 静默忽略 —— 表现为「配了 `trusted_proxies` 却还是显示 CDN 节点 IP」。
+
+**不需要**为 CDN 写 `[transport] protocol = "wss"`、`websocket.path` 或任何证书
+（HTTP 回源时）：服务端在 `bindPort` 上按连接内容自动判定 tcp / tls / ws / wss，
+没有任何与路径、Host 相关的配置项。
+
+改完先预检，再启动：
+
+```bash
+frps --check -c frps.cdn.toml      # 不绑端口；证书能否装载、CIDR 是否合法在这里暴露
+# 配置 frps.cdn.toml 合法
+
+./frps -c frps.cdn.toml
 ```
 
 启动后**先在源站本机自检**（必须返回 200）：
@@ -180,6 +207,10 @@ curl -i http://127.0.0.1:7000/
 # Content-Type: text/plain; charset=utf-8
 # ok
 ```
+
+> 启动日志里若出现 `未强制 TLS（transport.tls.force = false）`：
+> HTTP 回源时这条是**有效告警** —— CDN 到源站这一段是明文，token 在回源段可被嗅探。
+> 想消掉它只有两条路：改 HTTPS 回源（见 5.4），或接受「回源段明文」这个前提。
 
 ### 5.2 CDN 控制台（以阿里云 ESA 为例）
 
@@ -201,45 +232,166 @@ curl -i http://127.0.0.1:7000/
 ```toml
 serverAddr = "frps.example.com"   # 加速域名；写成 IP 时必须配下面的 serverName
 serverPort = 443                  # CDN 对外端口（HTTPS）
-auth.method = "token"
-auth.token = "和服务端一致的强令牌"
+
+[auth]
+method = "token"
+token = "和服务端一致的强令牌"
 
 [transport]
 protocol = "wss"
 
 [transport.tls]
 serverName = "frps.example.com"   # TLS SNI + HTTP Host + Origin 都取它
-verifyServerCert = false          # 用 CDN 的正规证书可以设 true；自签才需 false
+verifyServerCert = true           # CDN 用的是正规证书，建议开启校验
 ```
 
 说明：
 
 * **不要写 `[transport.websocket] path`**：默认路径 `/~!frp` 在带 `Origin` 的前提下
   实测就能拿到 101；服务端不校验路径，改它不产生任何效果。
-* `protocol = "wss"` 已包含 TLS，不用再写 `tls.enable = true`。
-  想让 CDN 看不到 frp 内容，可再加 `tls.enable = true`（默认即为 true），
-  这是 WebSocket 帧之内的第二层加密，与 CDN 终结的外层 TLS 互不冲突。
+* **`verifyServerCert = true` 建议开着**：连 CDN 时对面用的是正规证书，能真正验证
+  「这是 CDN」。例外：CDN 用了私有 CA、或运行环境缺根证书导致握手报证书错误 ——
+  这时把该 CA 填进 `trustedCaFile`，或退回 `false`（只防窃听、不验证对方身份）。
+* `protocol = "wss"` 已经包含 TLS（内部等价于 `tls.enable = true`），再写一遍
+  `tls.enable` 不会多一层。想让 CDN 看不到隧道**里面**的内容，要开
+  **数据面加密**：`[transport] useEncryption = true`（见 [CONFIG.md §6](CONFIG.md)）——
+  它加密的是 frp 数据帧，与 CDN 终结的外层 TLS 互不冲突。
 * `Origin` 由客户端自动补，值按 `websocket.host → tls.serverName → serverAddr` 回落，
   与 `Host` 同源。
 
-### 5.4 若坚持 HTTPS 回源
+### 5.4 HTTPS 回源：frps 必须配证书
 
-源站 `frps.toml` 增加证书，CDN 侧「回源协议」改 HTTPS：
+这一段是**唯一需要动证书**的场景。先说清楚证书到底属于哪一段链路：
+
+| 链路 | 谁提供证书 | frps 要配吗 |
+|---|---|---|
+| frpc → CDN 边缘 | CDN（加速域名的证书） | 不要 |
+| CDN → frps（**HTTP 回源**） | 这一段没有 TLS | 不要 |
+| CDN → frps（**HTTPS 回源**） | **只能由 frps 提供** | **必须配** |
+
+也就是说：**用了 CDN 不等于要给 frps 配证书**，只有当你把回源协议选成 HTTPS 时才是。
+反过来说，一旦选了 HTTPS 回源又不配证书，frps 会退回启动时自动生成的自签证书 ——
+而那张证书是给「客户端不校验」的场景用的，CDN 一校验就必然失败。
+
+#### 5.4.1 配置写法
+
+完整模板见 [`assets/frps.cdn-https.toml`](../assets/frps.cdn-https.toml)。相对 HTTP 回源
+只多一个表：
 
 ```toml
+# ... 顶层键与 HTTP 回源完全一致（bindAddr / bindPort / trusted_proxies / allowPorts）
+# 注意：[transport.tls] 是表头，必须放在所有顶层键之后、[auth] 之后也可以
+
+[auth]
+method = "token"
+token = "换成至少 16 位的随机强令牌"
+
 [transport.tls]
-certFile = "/etc/ssl/frps.example.com.pem"
-keyFile  = "/etc/ssl/frps.example.com.key"
+certFile = "/etc/nfrp/certs/fullchain.pem"
+keyFile  = "/etc/nfrp/certs/privkey.pem"
 ```
 
-frps 会在第 2 层做 TLS 协商，再在第 3 层对解密后的流判 HTTP，所以健康检查与
-WSS 升级都能工作。要注意 CDN 是否校验源站证书（自签需在 CDN 侧关闭校验）。
+三条硬性要求：
+
+1. **`certFile` 与 `keyFile` 必须同时配置**。只配一个 frps 直接启动失败，错误是
+   `transport.tls.certFile 与 keyFile 必须同时配置（当前只配了一个）`。
+2. **证书里的域名必须覆盖 CDN 回源使用的 SNI / Host**（通常就是加速域名）。
+   域名对不上时，握手会以 `hostname mismatch` 失败 —— 证书本身再正规也没用。
+3. **`certFile` 要放 fullchain**（服务器证书 + 中间证书）。只给叶子证书时，
+   部分 CDN 会判「证书链不完整」。
+
+证书可以从这三处来，都能用：
+
+* 云厂商 / 正式 CA 签发的证书（最省事，CDN 天然信任）；
+* **Let's Encrypt**：家宽没有 80 端口就用 `acme.sh --dns` 的 DNS-01 方式签发，
+  之后把 `fullchain.pem` 与 `privkey.pem` 指给 frps；
+* 自签（仅限下面 5.4.4 的两种情形）。
+
+#### 5.4.2 不配证书会怎么样（实测）
+
+不配 `[transport.tls]` 时，frps 用的是进程启动时生成的自签证书。实测它长这样：
+
+```text
+subject = CN=rcgen self signed cert
+issuer  = CN=rcgen self signed cert
+X509v3 Subject Alternative Name:
+    DNS:frp                      ← 固定是 "frp"，不是你的域名
+```
+
+于是任何**会校验证书**的对端（CDN 的 HTTPS 回源就是）都会拒绝：
+
+| 情形 | 对端看到的结果（openssl 实测原文） | CDN 侧通常表现为 |
+|---|---|---|
+| 不配证书，对端校验证书 | `verify error:num=18:self-signed certificate` | 521 / 525 / 526 或 `ssl_handshake_failure`（各家码不同） |
+| 配了证书，但域名对不上 | `verify error:num=62:hostname mismatch` | 同上，日志里常带 `certificate is not valid for the requested name` |
+| 配了证书且域名正确 | `Verify return code: 0 (ok)` | 正常，健康检查与 WS 升级都能走通 |
+| 不配证书，但对端**关闭**了证书校验 | 握手能成，但 `Verify return code: 18` | 能通 —— 但等于不验证源站身份，中间人可以冒充源站 |
+
+最后一行是常见的「把它调通再说」做法：在 CDN 控制台关掉「校验源站证书」，
+自签也能握手成功。**它解决的是可用性，不是安全性** —— 流量仍然加密，
+但 CDN 不再确认对面真的是你的 frps。
+
+另外别忘了 HTTP 回源那条：CDN 到源站是**明文 HTTP**，token 在回源段裸奔。
+选 HTTPS 回源 + 配证书，才把这一段也盖住。这也是 frps 启动日志里
+`未强制 TLS（transport.tls.force = false）` 那条告警在 CDN 场景下的真实含义。
+
+#### 5.4.3 配错了会怎么样（`--check` 实测原文）
+
+`frps --check -c frps.cdn-https.toml` 不绑端口，但会真的去装载证书，
+所以在 systemd reload / 重启生产之前先跑它：
+
+| 配错方式 | 报错原文 |
+|---|---|
+| 只写 `certFile`，没写 `keyFile` | `Error: transport.tls.certFile 与 keyFile 必须同时配置（当前只配了一个）` |
+| `keyFile` 路径写错 / 文件不存在 | `Error: 读取 PEM 文件 ... 失败` → `系统找不到指定的文件。 (os error 2)` |
+| `certFile` 误填成私钥文件 | `Error: 证书文件 ... 里没有 CERTIFICATE 块` |
+| 只配 `trustedCaFile`（想做 mTLS） | `Error: 配置了 transport.tls.trustedCaFile，但没有 certFile/keyFile` |
+| 全空 | 不报错 —— 退回自签证书，也就是上面 5.4.2 的第一种情形 |
+
+注意 `--check` 只能证明**证书能被装载**，不能证明**CDN 会信任它**。
+域名是否匹配、证书链是否完整、CDN 有没有该校验证书，只能在边缘侧验证（见 5.5）。
+
+#### 5.4.4 自签证书的两种可用情形
+
+确实不想买 / 不想申请证书时，自签也能用，但必须满足其一：
+
+* **CDN 控制台关闭「校验源站证书」**（可用性达标，安全性打折，见上表）；
+* **把自签 CA 上传到 CDN 的自定义证书链**，让 CDN 认它。
+
+自签时要注意：**不要沿用 frps 内置那张**（CN 是 `rcgen`，SAN 固定 `frp`），
+要自己签一张把加速域名写进 SAN 的，例如：
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout privkey.pem -out fullchain.pem \
+  -subj "/CN=frps.example.com" \
+  -addext "subjectAltName=DNS:frps.example.com"
+```
+
+#### 5.4.5 两个容易忽略的限制
+
+* **换证书必须重启 frps，不能热重载**。rustls 的服务端配置是进程全局的，
+  源码会明确拒绝中途更换：`服务端 TLS 配置已用另一组 certFile/keyFile/trustedCaFile 初始化...请重启进程`。
+  Let's Encrypt 自动续期后记得加一条 `reload-or-restart frps` 的钩子。
+* **`[transport.tls]` 管不到 QUIC**。QUIC 永远用固定自签证书（内部名字 `nfrp.frp`），
+  也没有配置项可以换。所以 CDN 场景不要选 QUIC —— 它既不能被 HTTP CDN 代理回源，
+  也没法拿正式证书。CDN 回源认准 `wss`。
 
 ### 5.5 验证顺序（不要跳步）
 
 ```bash
+# ⓪ 配置预检：不绑端口，语法 / CIDR / 证书能否装载都在这步暴露
+frps --check -c frps.cdn-https.toml
+# 配置 frps.cdn-https.toml 合法
+
 # ① 源站自检：直连 frps 端口，普通 HTTP 必须 200
 curl -i http://<源站IP>:7000/
+
+# ①' 仅 HTTPS 回源：确认源站出示的是你自己的证书，不是内置自签
+openssl s_client -connect <源站IP>:7000 -servername frps.example.com </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -ext subjectAltName
+# 期望：CN / SAN 是加速域名
+# 若是 CN=rcgen self signed cert + DNS:frp，说明 [transport.tls] 没生效或路径写错
 
 # ② 边缘自检：向 CDN 发一条 WS 升级请求，期望 101
 python _interop/probe_cdn.py frps.example.com 443 /~!frp /
@@ -247,6 +399,9 @@ python _interop/probe_cdn.py frps.example.com 443 /~!frp /
 # ③ 客户端
 ./frpc -c frpc.toml      # 出现 login to server success 即成功
 ```
+
+第 ② 步拿到 `521` / `525` / `526` 时，先在 CDN 控制台确认「回源协议」与
+「是否校验源站证书」，再回到第 ①' 步看源站到底出示了什么 —— 顺序反了会白折腾。
 
 * ① 不通过 ⇒ 源站版本不对（不是 0.8.1+）或端口/协议填错。
 * ② 不通过 ⇒ 问题在 CDN 边缘（403 查 Origin/WAF，520 查回源）。
@@ -317,5 +472,9 @@ iStoreOS / OpenWrt 的 luci-app-frps：UCI 里设 `frps.main.bindAddr='::'` 后�
 | 要让服务端也认客户端的路径 | 不需要。判定只看请求行与 `Upgrade` 头，服务端没有路径配置项 |
 | 520 一定要修好才能用 | 若 CDN 因健康检查判源站不健康，可能整站不可用，建议还是升到 0.8.1+ 让它回 200 |
 | 开了 CDN 就不用 token 了 | CDN 不做 frp 认证，token 仍是唯一边界 |
-| CDN 证书 = 端到端加密 | CDN 会终结外层 TLS；`tls.enable = true` 提供的是 WS 帧内的第二层加密 |
+| CDN 证书 = 端到端加密 | CDN 会终结外层 TLS。要**端到端到源站**，用 HTTPS 回源 + 源站证书（frps 侧 `[transport.tls]`）；要隐藏隧道**内容**，用数据面加密 `useEncryption = true`。`tls.enable` 在 wss 下不会多出一层 |
 | `serverAddr` 写 IP 更稳妥 | 写 IP 会导致 SNI/Host 变成 IP，CDN 找不到站点，必须补 `tls.serverName` |
+| 用了 CDN 就得给 frps 配证书 | **不用**。只有「HTTPS 回源」才需要；「HTTP 回源」时 frps 侧没有证书可配。混淆这两者会白白折腾 |
+| 证书配上了就一定通 | 不一定。证书域名必须覆盖 CDN 回源用的 SNI/Host，否则报 `error 62: hostname mismatch`；`--check` 只验证能否装载，不验证 CDN 是否信任 |
+| 自签证书填进去也能用 | 只在 CDN **关闭**「校验源站证书」时能用；开着校验时对端报 `error 18: self-signed certificate`。内置那张证书 SAN 固定为 `frp`，不是你的域名 |
+| HTTPS 回源 + 证书 = 端到端加密到源站 | 对。这才是不配证书与配证书的真正区别：HTTP 回源时 CDN→源站是**明文**，token 在回源段可被嗅探 |
