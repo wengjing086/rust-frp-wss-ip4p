@@ -599,10 +599,10 @@ pub fn normalize_client(root: &mut toml::Value) {
 
     // ★ v0.8.1：`[transport.websocket] host / path`。
     //
-    // 这两个字段在 CDN / 反代场景下是刚需：官方默认路径 `/~!frp` 里的 `~!`
-    // 很容易被 WAF 当扫描流量拦掉（阿里云 ESA 实测直接 403），
-    // 客户端必须能把路径改成 `/ws` 这种"正常业务"路径。
-    // 不搬过来的话，配置里写了也不生效，用户会以为是服务端不认路径。
+    // 搬这两个字段是为了兼容官方 TOML（尤其 `host` 决定 SNI / Host / Origin）。
+    // ★ 路径**不参与服务端判定**：服务端只认「合法 WS 升级请求」，把 path 改成
+    //   任意"正常业务"路径既不解决 WAF 403，也不需要服务端同步；真正让 CDN
+    //   403 消失的是 v0.8.1 自动补的 `Origin` 头（详见 docs/CDN.md）。
     hoist_websocket(t);
 
     // 认证令牌：frp 新写法 `auth.token`，老写法 `[common] token`。
@@ -1169,14 +1169,14 @@ serverName = "frps.wengjing.top"
 
 [transport.websocket]
 host = "frps.wengjing.top"
-path = "/ws"
+path = "/any/path"
 "#;
         let cfg = parse_client_toml(text).unwrap();
         assert_eq!(cfg.transport_protocol, "wss");
         assert_eq!(cfg.tls_server_name, "frps.wengjing.top");
         assert_eq!(cfg.websocket.host, "frps.wengjing.top");
-        assert_eq!(cfg.websocket.path, "/ws");
-        assert_eq!(cfg.websocket.effective_path(), "/ws");
+        assert_eq!(cfg.websocket.path, "/any/path");
+        assert_eq!(cfg.websocket.effective_path(), "/any/path");
         assert!(cfg.websocket_tls(), "wss 应当走 TLS");
     }
 

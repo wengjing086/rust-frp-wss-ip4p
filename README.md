@@ -103,27 +103,38 @@ frpc -c frpc.toml
 
 ### 2.1 放在 CDN / WAF 后面（0.8.1+）
 
-CDN 场景有两个坑，**都不是客户端能单方面解决的**：
+CDN 后面失败的原因基本只有三类，**按现象对号入座**：
 
-* `GET /~!frp` 会被 WAF 当扫描流量拦掉（实测阿里云 ESA 直接 `403 Forbidden`）；
-* CDN 回源健康检查发 `GET /`，老 frps 不会答 HTTP ⇒ CDN 判源站不健康，对外 `520`。
+| 现象 | 真正原因 | 谁来解决 |
+|---|---|---|
+| `403`（`Server: ESA` / `cloudflare`） | 握手请求缺 `Origin` 头，被 WAF 当成自动化流量拦在边缘 | 客户端 0.8.1+ 已自动带该头；CDN 侧放行 WS 升级 |
+| `520` / `http_response_incomplete` | 源站不会回答普通 HTTP，`GET /` 健康检查拿不到响应 | 服务端 0.8.1+ 会对 `/`、`/health*` 回 `200 ok` |
+| `521` / 回源连不上 | 回源端口/协议不对，或家宽无公网 IPv4 时 frps 只监听 `0.0.0.0` | `bindAddr = "::"`，并让 CDN 回源端口对齐 `bindPort` |
 
-0.8.1 起服务端按"合法 WebSocket 升级请求"判定，**路径不再限制**，并且对普通
-HTTP 请求回 200。客户端只需要把路径换成"正常业务路径"，Host 用给 CDN 的域名：
+**路径不是问题**：服务端判定的是「是不是一条合法的 WebSocket 升级请求」（请求行
+含 `HTTP/1.` + `Upgrade: websocket`），**不比较路径**。改 `websocket.path` 既不解决
+403 也不解决 520，服务端更没有对应的路径配置项 —— 配置里不要写这一项。
+
+客户端最小可用配置：
 
 ```toml
+serverAddr = "frps.example.com"   # 加速域名
+serverPort = 443
+auth.method = "token"
+auth.token = "和服务端一致的强令牌"
+
 [transport]
 protocol = "wss"
 
 [transport.tls]
-serverName = "frps.example.com"   # ← 给 CDN 用的域名：TLS SNI + HTTP Host 都用它
-
-[transport.websocket]
-path = "/ws"                      # ← 绕开 WAF 对 /~!frp 的拦截
+serverName = "frps.example.com"   # 加速域名：TLS SNI + HTTP Host + Origin 都取它
+verifyServerCert = false          # 用 CDN 的正规证书可以设 true；自签才需 false
 ```
 
-完整部署步骤（含 ESA 侧要改哪几项、怎么用 `probe_cdn.py` 分清 403 与 520）
-见 [docs/CDN.md](docs/CDN.md)。
+服务端**不需要任何 CDN 专用配置**，照常用 `bindPort`，建议 `bindAddr = "::"`。
+
+完整教程（从零部署、CDN 控制台逐项设置、两级嗅探原理、403/520 实测数据、
+排障矩阵、HTTPS 回源差异、IPv6 回源案例）见 [docs/CDN.md](docs/CDN.md)。
 
 ### 3. IP4P（同样不用改配置）
 

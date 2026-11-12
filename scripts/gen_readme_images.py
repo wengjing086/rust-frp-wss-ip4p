@@ -83,7 +83,7 @@ s += card(28, 84, 186, 62, '业务服务', 'RDP 3389 · SSH 22 · Web 80', BLUE)
 s += [AR(121, 146, 121, 165)]
 s += card(28, 168, 186, 62, 'frpc', '官方 frpc 或本项目 frpc', BLUE)
 s += pill(28, 242, 78, '无公网 IP', BLUE)
-s += card(284, 84, 186, 62, 'CDN / WAF', '路径 /ws 可自定义', MUTED, dashed=True)
+s += card(284, 84, 186, 62, 'CDN / WAF', '路径无关 · 认 WS 升级', MUTED, dashed=True)
 s += card(284, 168, 186, 62, 'IP4P 解析', 'TXT / AAAA → IP:端口', MUTED)
 s += pill(284, 242, 78, '可跳过', MUTED)
 s += card(540, 84, 232, 62, 'frps · bindPort 7000', '同端口自动识别四种协议', TEAL)

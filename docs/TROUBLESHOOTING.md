@@ -83,9 +83,9 @@ GET /~!frp  +User-Agent（无 Origin） → 403
 不影响默认路径的 wss 登录。要让 520 消失，把源站换成 0.8.1+ 的 frps
 （它会对 `GET /` 回 200）。详见 [CDN.md](CDN.md)。
 
-如果确认 WAF 是**按路径**拦的（带 `Origin` 仍 403，或者报 404/520），
-再改路径：客户端 `[transport] websocket.path = "/ws"`，并要求服务端认这个路径
-（本项目 frps 认任意路径；官方 frps 只认 `/~!frp`，需要打补丁）。
+带 `Origin` 仍 403 时，去查 WAF 自定义规则、地域封禁或速率限制 —— **改路径无效**：
+服务端不比较路径，403 也不是路径规则造成的。若报 404，多半是反代剥掉了
+`Upgrade` / `Connection` 头，让升级请求被当成普通 HTTP。详见 [CDN.md](CDN.md)。
 
 如果只是不想让隧道流量经过 CDN，也可以让 frpc **直连源站**：
 

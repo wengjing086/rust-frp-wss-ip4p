@@ -949,7 +949,7 @@ mod tests {
     fn 升级请求必须留着_connection_和_upgrade() {
         let b = bridge("http2http");
         let mut req = parts(&[
-            "GET /ws HTTP/1.1",
+            "GET /any/path HTTP/1.1",
             "Host: h",
             "Connection: Upgrade",
             "Upgrade: websocket",

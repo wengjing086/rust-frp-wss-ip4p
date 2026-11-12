@@ -142,11 +142,11 @@ async fn plain_websocket_login_still_works() {
 // ★ v0.8.1：CDN 适配
 // ---------------------------------------------------------------------------
 
-/// **CDN 场景的核心用例**：路径换成 `/ws` 也必须能升级。
+/// **路径无关的回归用例**：任意路径都必须能升级。
 ///
-/// 背景：官方默认路径 `/~!frp` 里的 `~!` 在阿里云 ESA 这类 WAF 上很容易被
-/// 当成扫描流量直接 403。客户端把 `[transport.websocket] path` 改成 `/ws`
-/// 之后，服务端**不能**再死认 `GET /~!frp`，否则这条链路永远握不上手。
+/// 背景：服务端**不能**死认 `GET /~!frp`，否则自定义路径永远握不上手。
+/// 注意：改路径本身不是 CDN 403 的解法（真因是缺 `Origin`），这里只验证
+/// 「路径不参与判定」这件事，见 docs/CDN.md。
 #[tokio::test]
 async fn wss_login_with_custom_path() {
     let port = start_server().await;
@@ -156,7 +156,7 @@ async fn wss_login_with_custom_path() {
     let tls_stream = tls::connect_client(Box::pin(tcp), &tls_options(true))
         .await
         .expect("TLS 握手");
-    let ws = ws::connect(tls_stream, "frps.example.com", "/ws", &[])
+    let ws = ws::connect(tls_stream, "frps.example.com", "/any/path", &[])
         .await
         .expect("自定义路径的 WSS 升级");
     login(Box::pin(ws)).await;
@@ -246,7 +246,7 @@ async fn trusted_proxy_uses_forwarded_for() {
     let ws = ws::connect(
         tls_stream,
         "frps.example.com",
-        "/ws",
+        "/any/path",
         &[("X-Forwarded-For", "203.0.113.9, 10.0.0.2")],
     )
     .await
@@ -296,7 +296,7 @@ async fn untrusted_peer_ignores_forwarded_for() {
     let ws = ws::connect(
         Box::pin(tcp),
         "frps.example.com",
-        "/ws",
+        "/any/path",
         &[("X-Forwarded-For", "203.0.113.9")],
     )
     .await

@@ -213,7 +213,7 @@ static CONN_END_LOG: nfrp_common::util::FoldedLog = nfrp_common::util::FoldedLog
 ///    协商失败直接断连 ⇒ CDN 判定源站不健康，回 520 / 403。
 ///
 /// 现在改判"**是不是一条合法的 WebSocket 升级请求**"：路径随便配
-/// （`/ws`、`/api/v1/stream` 都行），安全边界仍然由 token 认证把守，
+/// （任意路径都行），安全边界仍然由 token 认证把守，
 /// 不靠路径保密。
 const MAX_HTTP_HEAD: usize = 16 * 1024;
 

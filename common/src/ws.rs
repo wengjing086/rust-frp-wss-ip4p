@@ -268,10 +268,12 @@ where
 /// 这些码全是"中间那一层"（CDN / WAF / 反代）回的，不是 frp 回的；
 /// 光报 `403` / `520` 用户根本不知道该改哪。实测案例：
 ///
-/// * 阿里云 ESA 在 `bindPort` 前面时，`GET /~!frp` 被 WAF 判为可疑路径 → **403**
-/// * 路径换成 `/ws` 后 WAF 放行，但 CDN 回源失败 → **520 Origin Error**
+/// * 阿里云 ESA 在 `bindPort` 前面时，缺 `Origin` 的 WS 升级被判为自动化流量 → **403**
+/// * 带上 `Origin` 后 WAF 放行，但旧版源站不回 HTTP → **520 Origin Error**
 ///
 /// 两种现象、两处不同改法，靠状态码 + `Server` 头就能区分开。
+/// ★ 路径不是原因：服务端判定只看请求行与 `Upgrade` 头，提示里不要再建议改
+///   `websocket.path`（那是无效的，见 docs/CDN.md）。
 fn hint_for_status(code: u16, head: &str) -> &'static str {
     let server = header_value(head, "server").unwrap_or_default();
     let via_gateway = ["esa", "cloudflare", "awselb", "tengine", "nginx", "envoy"]
@@ -285,14 +287,13 @@ fn hint_for_status(code: u16, head: &str) -> &'static str {
                  **最常见原因是握手请求少了 `Origin` 头** —— 阿里云 ESA 这类网关\
                  对没有 Origin 的 WebSocket 升级一律 403，而官方 Go frpc 恰好\
                  总会带上它，所以同一条链路它通、我们不通（v0.8.1 已内置该头）。\
-                 若仍在 403，再考虑路径被判可疑：WAF 可能拦默认的 `/~!frp`，\
-                 此时改成普通路径 `[transport] websocket.path = \"/ws\"`\
-                 并让服务端同步（本项目 frps 认任意路径；官方 frps 需打补丁）。"
+                 若仍在 403，查 WAF 自定义规则、地域封禁与速率限制；**改路径无效**\
+                 （服务端判定只看请求行与 Upgrade 头，不比较路径）。"
             } else {
                 "服务端拒绝握手：检查 `auth.token`，以及服务端是否限制了来源 IP。"
             }
         }
-        404 => "路径对不上：客户端 `websocket.path` 必须与服务端/反代配置一致。",
+        404 => "请求被当成普通 HTTP：检查 CDN / 反代是否透传 Upgrade 与 Connection 头（服务端不校验路径）。",
         502 | 520 | 521 | 522 | 523 | 524 => {
             "CDN **回源失败**（拿到的是 CDN 的边缘错误页，请求没到 frps）。\
              依次确认：① 源站 frps 正在运行且端口与 CDN 回源端口一致；\
@@ -778,17 +779,15 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     /// 握手被中间网关拒绝时，提示必须**区分 403 与 520** ——
-    /// 一个是"换路径"，一个是"修源站"，照着做反了会白折腾。
+    /// 一个是"边缘拒"（查 Origin / WAF），一个是"修源站"，照着做反了会白折腾。
     #[test]
     fn 状态码提示要能区分_cdn_的两种失败() {
         let esa_403 = "HTTP/1.1 403 Forbidden\r\nServer: ESA\r\n\r\n";
         let h = hint_for_status(403, esa_403);
-        // 首要原因是缺 Origin（实测结论），路径只是次要怀疑对象。
+        // 首要原因是缺 Origin（实测结论）；路径无关，提示里不该再教人改路径。
         assert!(h.contains("Origin"), "403 必须先提示缺 Origin：{h}");
-        assert!(
-            h.contains("websocket.path"),
-            "403 还应给出换路径的兜底：{h}"
-        );
+        assert!(h.contains("改路径无效"), "403 必须明确说明改路径无效：{h}");
+        assert!(!h.contains("/ws"), "提示里不该再出现无效的路径示例：{h}");
 
         let esa_520 = "HTTP/1.1 520 Origin Error\r\nServer: ESA\r\n\r\n";
         let h = hint_for_status(520, esa_520);
