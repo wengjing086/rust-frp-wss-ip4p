@@ -14,22 +14,25 @@
 
 ```mermaid
 flowchart TB
-  LAN["🏠 内网（无公网 IP）<br/>业务服务 RDP / SSH / Web 接到 frpc"]
-  EDGE["☁️ 可选链路<br/>CDN / WAF：路径 /ws 可自定义<br/>IP4P：TXT / AAAA → IPv4:端口，覆盖拨号目标"]
-  SRV["🌐 公网服务器 · frps bindPort 7000<br/>同端口自动识别 TCP / TLS / WS / WSS"]
-  CORE["frp v0.71.0 控制面<br/>yamux + 工作连接池 · 内嵌面板（真实 IP / 归属地 / 流量）"]
-  USER["💻 外部访问者<br/>remotePort 或 stcp visitor"]
-
-  LAN -->|"wss / quic / tls / tcp 直连"| SRV
-  LAN -.->|"经过 CDN"| EDGE
-  EDGE -.->|"HTTPS 回源"| SRV
+  LAN["内网 frpc"]
+  EDGE["可选：CDN / WAF · IP4P"]
+  SRV["frps 同端口 7000"]
+  CORE["frp 控制面 · 工作连接池"]
+  PANEL["内嵌面板 · 流量统计"]
+  USER["外部访问者"]
+  LAN -->|"wss 等"| SRV
+  LAN -.->|"可选"| EDGE
+  EDGE -.->|"回源"| SRV
   SRV --> CORE
-  USER -->|"访问公网端口或 stcp"| CORE
+  CORE --> PANEL
+  USER -->|"访问"| CORE
 ```
 
-> 图里最关键的一点：**WSS、IP4P、CDN 适配都不要改 `frps.toml`**。服务端按连接内容
-> 自动判定协议，客户端只改官方本来就有的 `transport.protocol = "wss"` 一行；
-> 隧道建立后，内网服务与外部访问者之间的字节在 frpc ↔ frps 之间原样往返。
+> 从上到下：内网的 RDP / SSH / Web 接到 frpc，可经 CDN / WAF（路径任意）或直连公网；
+> frps 在 `bindPort` 上自动识别 TCP / TLS / WS / WSS，之后是 frp 控制面与内嵌面板
+> （真实 IP、归属地、流量）；外部访问者通过 remotePort 或 stcp 接入，隧道内字节原样往返。
+> **WSS、IP4P、CDN 适配都不要改 `frps.toml`**，客户端只加官方本来就有的
+> `transport.protocol = "wss"` 一行。
 
 | 需求 | 实现 |
 |---|---|
@@ -79,14 +82,14 @@ frps -c frps.toml
 
 ```mermaid
 flowchart TD
-  A["新连接到达 bindPort 7000"] --> B{"首字节像 HTTP 请求?"}
-  B -->|"是 · 带 Upgrade: websocket"| C["明文 WebSocket 升级<br/>路径不限，如 /ws"]
-  B -->|"是 · 普通 HTTP"| D["回一个最小 HTTP 响应<br/>CDN 健康检查判为健康"]
-  B -->|"否"| E["TLS 协商<br/>0x16 标准 / 0x17 frp 自定义首字节"]
-  E --> F{"解密后仍是 WS 升级请求?"}
-  F -->|"是"| G["WSS 升级 ★ 本项目新增"]
-  F -->|"否"| H["字节无损回放<br/>frp over TLS / TCP"]
-  C --> I["汇入同一套 yamux + frp 控制流程"]
+  A["新连接到 bindPort"] --> B{"像 HTTP 请求?"}
+  B -->|"WS 升级"| C["明文 WebSocket"]
+  B -->|"普通 HTTP"| D["回 HTTP 200"]
+  B -->|"否"| E["TLS 协商"]
+  E --> F{"解密后仍是 WS?"}
+  F -->|"是"| G["WSS 升级"]
+  F -->|"否"| H["回放字节 · 原生 frp"]
+  C --> I["同一套 yamux 控制面"]
   G --> I
   H --> I
 ```
@@ -166,11 +169,11 @@ auth.token = "..."
 
 ```mermaid
 flowchart TB
-  A["① serverAddr 是 IP 字面量?<br/>是 → 直接拨号，零 DNS 开销"]
-  B["② 否 → 查 TXT<br/>base64 / 明文 IPv4:端口，命中即返回"]
-  C["③ TXT 未命中 → 查 AAAA<br/>2001:0000::/16 里解出 IPv4 + 端口"]
-  D["④ 都没命中 → 回退<br/>原样 serverAddr + serverPort，与官方一致"]
-  E["结果：覆盖拨号目标"]
+  A["1. IP 字面量 · 直拨"]
+  B["2. 查 TXT"]
+  C["3. 查 AAAA"]
+  D["4. 都未命中 · 回退"]
+  E["覆盖拨号目标"]
   A --> B --> C --> D --> E
 ```
 
