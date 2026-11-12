@@ -1,8 +1,47 @@
 # rust-frp-wss-ip4p
 
+[![Release](https://img.shields.io/github/v/release/wengjing086/rust-frp-wss-ip4p?label=release&color=2ea44f)](https://github.com/wengjing086/rust-frp-wss-ip4p/releases)
+[![frp wire](https://img.shields.io/badge/frp%20wire-v0.71.0-1f6feb)](https://github.com/fatedier/frp)
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/Windows%20%7C%20Linux%20%7C%20macOS-6f42c1)](https://github.com/wengjing086/rust-frp-wss-ip4p/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-2ea44f)](LICENSE)
+
 **用 Rust 写的 frps / frpc 整合发行版**：把三个仓库的能力合到一个项目里，
 配置文件与官方 frp 完全保持一致，服务端同端口原生支持 WSS，客户端支持 IP4P，
 并针对 Windows 安全软件的误报做了合规处理。
+
+先看一眼它长什么样 —— 左边是没公网 IP 的内网，右边是公网上的 frps：
+
+```mermaid
+flowchart LR
+  subgraph LAN["🏠 内网（无公网 IP）"]
+    APP["业务服务<br/>RDP / SSH / Web"]
+    FRPC["frpc<br/>本项目 或 官方 frp"]
+  end
+  subgraph EDGE["☁️ 公网链路（可选）"]
+    CDN["CDN / WAF<br/>路径 /ws 可自定义"]
+    IP4P["IP4P 解析<br/>TXT / AAAA → IPv4:端口"]
+  end
+  subgraph SRV["🌐 公网服务器"]
+    PORT["frps · bindPort 7000<br/>同端口 TCP / TLS / WS / WSS"]
+    CORE["frp v0.71.0 控制面<br/>yamux + 工作连接池"]
+    PANEL["内嵌面板<br/>真实 IP · 归属地 · 流量"]
+  end
+  USER["💻 外部访问者<br/>remotePort / stcp visitor"]
+
+  APP <--> FRPC
+  IP4P -.->|"覆盖拨号目标"| FRPC
+  FRPC -->|"wss / quic / tls / tcp"| CDN
+  FRPC -->|"直连"| PORT
+  CDN -.->|"HTTPS 回源"| PORT
+  PORT --> CORE
+  CORE --> PANEL
+  USER -->|"访问公网端口或 stcp"| CORE
+  CORE <-->|"隧道内字节原样往返"| FRPC
+```
+
+> 图里最关键的一点：**WSS、IP4P、CDN 适配都不要改 `frps.toml`**。服务端按连接内容
+> 自动判定协议，客户端只改官方本来就有的 `transport.protocol = "wss"` 一行。
 
 | 需求 | 实现 |
 |---|---|
@@ -47,12 +86,27 @@ auth.token = "换成一个足够随机的强令牌"
 frps -c frps.toml
 ```
 
-`bindPort` 现在会**自动**同时接受：
+`bindPort` 现在会**自动**同时接受 `tcp` / `tls` / `websocket` / `wss`，
+靠的是两级嗅探 —— 明文层判一次，TLS 解密后再判一次：
 
-- 原生 `tcp`（默认）
-- `transport.tls.enable = true` 的 frp over TLS
-- `transport.protocol = "websocket"` 的明文 WebSocket
-- `transport.protocol = "wss"` 的 **TLS 内 WebSocket（本项目新增，同端口直连）**
+```mermaid
+flowchart TD
+  A["新连接到达 bindPort 7000"] --> B{"首字节像 HTTP 请求?"}
+  B -->|"是 · 带 Upgrade: websocket"| C["明文 WebSocket 升级<br/>路径不限，如 /ws"]
+  B -->|"是 · 普通 HTTP"| D["回一个最小 HTTP 响应<br/>CDN 健康检查判为健康"]
+  B -->|"否"| E["TLS 协商<br/>0x16 标准 / 0x17 frp 自定义首字节"]
+  E --> F{"解密后仍是 WS 升级请求?"}
+  F -->|"是"| G["WSS 升级 ★ 本项目新增"]
+  F -->|"否"| H["字节无损回放<br/>frp over TLS / TCP"]
+  C --> I["汇入同一套 yamux + frp 控制流程"]
+  G --> I
+  H --> I
+```
+
+判据是「**是不是一条合法的 WebSocket 升级请求**」，不是固定路径 `GET /~!frp`，
+所以放在 CDN / WAF 后面可以把路径换成任意正常业务路径；安全边界由 token 认证把守，
+不靠路径保密。官方 frps 只在 TLS **之前**嗅探，所以 `wss` 连它必须前置 nginx
+终结 TLS —— 本项目省掉的正是这一层。
 
 ### 2. 客户端
 
@@ -121,6 +175,21 @@ auth.token = "..."
 | 1 | TXT | `base64("IPv4:端口")`，如 `MjAzLjAuMTEzLjc6MTgyNDY=` ⇒ `203.0.113.7:18246`；也兼容明文 |
 | 2 | AAAA | IP4P 编码 IPv6（`2001:0000::/16`），端口在字节 10–11，IPv4 在字节 12–15 |
 | 3 | 回退 | 无匹配记录 ⇒ 原样使用 `serverAddr` + `serverPort`，与官方行为一致 |
+
+```mermaid
+flowchart LR
+  A["serverAddr"] --> B{"是 IP 字面量?"}
+  B -->|"是"| Z["直接拨号<br/>零 DNS 开销"]
+  B -->|"否 · 域名"| C["① 查 TXT"]
+  C -->|"base64 / 明文 IPv4:端口"| D["目标 = 203.0.113.7:18246"]
+  C -->|"未命中"| E["② 查 AAAA"]
+  E -->|"2001:0000::/16"| F["从 IPv6 字节解出 IPv4 + 端口"]
+  E -->|"未命中"| G["③ 回退<br/>原样 serverAddr + serverPort"]
+  D --> H["覆盖拨号目标"]
+  F --> H
+  G --> H
+  Z --> H
+```
 
 日志示例：
 
