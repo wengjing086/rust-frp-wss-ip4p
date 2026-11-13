@@ -1,3 +1,65 @@
+## v0.8.9 — 对齐官方 0.71.1/0.72.0 中的重连类修复
+
+**线协议没变，0.8.8 / 0.8.9 可以混用。**
+
+### 先说版本基线为什么不动
+
+官方 frp 已发到 v0.72.0，但 **v0.71.1 与 v0.72.0 都没有改动线协议或配置格式**，
+只有功能与 bug 修复。本项目的 `FRP_WIRE_VERSION` 仍是 `0.71.0`，它出现在
+`Login.version` / `LoginResp.version`、`frpc -v` 与面板 `/api/v2/version`，
+第三方控制面板会解析它决定下发 INI 还是 TOML。把它刷成 `0.72.0` 等于对外
+宣称「已用官方 0.72.0 二进制实测互通」，而 README 的互通矩阵实测基准是
+0.71.0 —— 那是虚假声明，所以刻意保持不动。
+
+逐条核对两版 release notes 后的结论：健康检查连续失败计数、VirtualNet
+重连路由与退避、CONNECT 早数据丢失、限流下工作连接残留、控制连接写失败
+即重连，本项目此前均已独立修复并带回归测试；Go yamux 忙循环、log 前缀
+数据竞争、NTLM 代理 challenge、DST 日流量统计属 Go 特有或本实现免疫，不适用。
+本版只移植下面三条仍有价值的修复。三个新功能（系统 CA 验证、`frpc reload`
+证书热刷新、独立 `metricsServer`）未纳入本版。
+
+### 1. 控制连接写加超时（WSS/CDN 反压不再挂死重连）
+
+WSS / CDN 链路上对端不读时，底层 `poll_write` 会一直返回 `Pending`。此前
+`send_msg` 没有写超时，会**永久**占住会话主循环 —— 心跳发不出去、重连被
+无限推迟，表现之一就是「刚连上很卡、流量大了才流畅」以及断线后迟迟不恢复。
+这是官方 v0.72.0 修的「WebSocket 写阻塞拖延重连」的同款症状。
+
+- `common/src/frp/conn.rs`：整段写入（含 flush）加 10 秒 `WRITE_TIMEOUT`。
+  `write_frame` 同走 `write_bytes`，一处覆盖全部写路径（含 NLink 扩展帧、
+  v2 握手帧）；`shutdown()` 的 flush 同样加超时，服务端拒绝 visitor 时不会被卡住。
+- `client/src/web.rs`：管理界面的写失败不再被吞成业务回执。新增
+  `LiveError::{Business, Fatal}`，写超时 / 读错 / 对端关闭归为 Fatal，经 `?`
+  冒泡出 `run_session` 立即触发重连；同名、被服务端拒绝等仍是业务失败。
+
+### 2. 重连名单取进程级活表
+
+注册循环与 `ResumeCommit` 对账此前都用启动时的 `cfg.proxies` 快照，于是运行期
+通过 `[webServer]` 或服务端面板新增的代理，重连后不会重新上报、还会被服务端
+判为 stale 回收；反过来，运行期**删掉**的代理重连后又会被旧快照注册回来。
+这是官方 v0.71.1 / v0.72.0 修的「重连期间配置变更丢失」的同族形态。
+
+- `client/src/main.rs`：抽出 `registration_list(&ProxyTable, &cfg)`，注册与对账
+  共用同一份活表快照，并补回归测试锁住「活表与 cfg 快照故意不一致」的场景。
+
+### 3. frps 会话主动关闭句柄
+
+官方 v0.72.0 要求立即释放被替换/失败控制连接的复用会话。本项目的工作连接
+本来就随 `ClientGuard::drop` 立即释放，但 yamux 会话对象只能等
+`SESSION_IDLE_TIMEOUT`（30 秒）看门狗。
+
+- `common/src/frp/mux.rs`：`MuxAcceptor` 加 oneshot 关闭句柄，实现 `Drop`
+  与 `close()`；驱动 `select!` 加一支 break。accept 循环一结束（正常结束 /
+  出错 / 被踢），会话与底层 TCP 立刻释放。
+
+### 验证
+
+`cargo test --workspace`：**1075 passed / 0 failed**，无编译警告。新增 5 条
+回归测试：写永久阻塞按超时报错、优雅关闭不被写阻塞挂住、重连名单活表语义、
+主动关闭立刻结束会话、acceptor drop 立刻释放底层连接。
+
+---
+
 ## v0.8.8 — frps 主端口关闭 Nagle，交互式流量不再攒包
 
 **线协议没变，0.8.7 / 0.8.8 可以混用。只有服务端有改动，只升 frps 即可。**

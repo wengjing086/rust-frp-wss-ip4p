@@ -8,7 +8,7 @@ members = ["common", "server", "client"]
 # 2026-11-13 已核对官方 v0.71.1 / v0.72.0：两版都没有线协议或配置格式变更，
 # 只有功能与 bug 修复，因此基线不需要跟着上游版本号走。改它等于对外宣称
 # 对齐 0.72，而互通矩阵是用官方 0.71.0 二进制实测的，属于虚假声明。
-version = "0.8.8"
+version = "0.8.9"
 edition = "2021"
 rust-version = "1.75"
 authors = ["wengjing086", "nfrp contributors"]
@@ -22,7 +22,7 @@ homepage = "https://github.com/wengjing086/rust-frp-wss-ip4p"
 
 [workspace.dependencies]
 # 内部 crate
-nfrp-common = { path = "common", version = "0.8.7" }
+nfrp-common = { path = "common", version = "0.8.9" }
 
 # 外部依赖（统一在此处锁定版本，保证各 crate 一致）
 # frp v2 控制通道加密，对应官方 go 实现的 HKDF-SHA256 + AES-256-GCM
