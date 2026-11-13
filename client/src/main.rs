@@ -1367,6 +1367,36 @@ async fn kcp_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     Ok(Box::pin(stream))
 }
 
+/// 本次会话要上报的全部代理：`(配置里的原始名, 线上 NewProxy 消息)`。
+///
+/// ★ v0.8.9：名单必须取**进程级活表**（`ProxyTable::list()`），不能用启动时
+/// 不可变的 `cfg.proxies` 快照。否则：
+/// * 运行期通过 `[webServer]` / 面板新增的代理，重连后不会重新上报，还会被
+///   服务端 `ResumeCommit` 判为「上次有、这次删了」直接回收；
+/// * 运行期删掉的代理，重连后又被旧快照重新注册回来。
+///
+/// 这是官方 frp 0.71.1 / 0.72.0 修的「重连期间配置变更丢失」的同族形态。
+/// 抽成函数是为了能直接对「重连名单」写回归测试，不必起一整个会话。
+fn registration_list(
+    proxies: &registry::ProxyTable,
+    cfg: &ClientConfig,
+) -> Vec<(String, NewProxy)> {
+    proxies
+        .list()
+        .iter()
+        .map(|p| {
+            let mut msg = NewProxy::from_config(p, &cfg.user);
+            // ★ 官方语义：`[transport].useEncryption` 是**客户端级**开关，
+            // 作用于所有代理。代理级字段是 NFRP 的扩展（允许单条单独开），
+            // 两者取或。服务端按这个字段决定要不要解密/解压，漏传会导致
+            // "客户端加密、服务端明文透传"——能连上但数据全乱。
+            msg.use_encryption |= cfg.use_encryption;
+            msg.use_compression |= cfg.use_compression;
+            (p.name.clone(), msg)
+        })
+        .collect()
+}
+
 /// 建立一次完整的控制连接会话，直到连接断开或出错。
 /// 把一条代理配置搬成线协议里的 `NewProxy` 消息。
 ///
@@ -1742,19 +1772,14 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
     // 剥一层再查表；万一遇到不回显前缀的实现，strip 对不带前缀的名字也是恒等的。
     // 代理表由 `main` 建好传进来（与本地管理界面共用同一张），这里**不重建** ——
     // 重建会把界面上刚加进去的代理抹掉。
-    for p in &cfg.proxies {
-        let mut msg = NewProxy::from_config(p, &cfg.user);
-        // ★ 官方语义：`[transport].useEncryption` 是**客户端级**开关，作用于所有代理。
-        // 代理级字段是 NFRP 的扩展（允许单条代理单独开），两者取或。
-        // 服务端就是按这个字段决定要不要解密/解压的，漏传会导致"客户端加密、
-        // 服务端明文透传"—— 用户看到的是能连上但数据全乱。
-        msg.use_encryption |= cfg.use_encryption;
-        msg.use_compression |= cfg.use_compression;
-        conn.send_msg(&FrpMessage::NewProxy(msg)).await?;
+    // ★ v0.8.9：名单取进程级活表，不用 cfg.proxies 启动快照（见 registration_list）。
+    let snapshot = registration_list(&proxies, &cfg);
+    for (_, msg) in &snapshot {
+        conn.send_msg(&FrpMessage::NewProxy(msg.clone())).await?;
     }
 
     let mut pending: std::collections::HashSet<String> =
-        cfg.proxies.iter().map(|p| p.name.clone()).collect();
+        snapshot.iter().map(|(name, _)| name.clone()).collect();
     while !pending.is_empty() {
         let event = tokio::time::timeout(Duration::from_secs(15), conn.recv_event())
             .await
@@ -1816,10 +1841,11 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
             .active()
             .contains(nfrp_common::nlink::CAP_RESUME)
     {
-        let names: Vec<String> = cfg
-            .proxies
+        // 同样取活表：把运行期新增的代理也纳入对账，否则续传会话会
+        // 把它们当成「上次有、这次删了」直接回收。
+        let names: Vec<String> = snapshot
             .iter()
-            .map(|p| NewProxy::from_config(p, &cfg.user).proxy_name)
+            .map(|(_, msg)| msg.proxy_name.clone())
             .collect();
         // 名单超过单帧上限时自动分片（0.7.2 起）。
         // 只有一片时线上格式与 0.7.1 完全相同，老服务端照常解析。
@@ -1955,7 +1981,7 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
                     &health,
                     &cfg,
                 )
-                .await;
+                .await?;
             }
             _ = ticker.tick() => {
                 conn.send_msg(&FrpMessage::Ping(Ping {
@@ -2363,6 +2389,44 @@ mod tests {
     //! 谁没被搬过去，断言就会指名道姓地失败。
 
     use super::*;
+
+    /// ★ v0.8.9 回归：重连时上报的代理名单必须来自**进程级活表**。
+    ///
+    /// 旧实现用启动时的 `cfg.proxies` 快照，于是：
+    /// ① 运行期新增的代理重连后消失（还被 ResumeCommit 判 stale 回收）；
+    /// ② 运行期删掉的代理重连后又复活。
+    /// 这里保持 `cfg.proxies` 与活表**故意不一致**，谁改回快照实现就会红。
+    #[test]
+    fn 重连名单取活表_运行期增删都生效() {
+        let mut cfg = ClientConfig::default();
+        cfg.user = "alice".to_string();
+        let mut boot = full_tcp_config();
+        boot.name = "from-config".to_string();
+        cfg.proxies = vec![boot.clone()];
+
+        let table = registry::ProxyTable::from_iter([boot]);
+
+        // 启动瞬间：活表与 cfg 快照一致
+        let list = registration_list(&table, &cfg);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "from-config");
+        assert_eq!(list[0].1.proxy_name, "alice.from-config");
+
+        // 运行期：管理界面新增一条、删掉配置里那条
+        let mut added = full_tcp_config();
+        added.name = "added-at-runtime".to_string();
+        table.insert_dynamic(added).expect("动态插入");
+        table.remove("from-config");
+
+        let list = registration_list(&table, &cfg);
+        let names: Vec<&str> = list.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["added-at-runtime"], "被删掉的代理不能复活");
+        assert_eq!(list[0].1.proxy_name, "alice.added-at-runtime");
+
+        // 启动快照仍旧是老样子 —— 证明上面结果不是从 cfg.proxies 来的
+        assert_eq!(cfg.proxies.len(), 1);
+        assert_eq!(cfg.proxies[0].name, "from-config");
+    }
 
     #[test]
     fn nlink_quic_门控看运行期开关与编译期能力() {

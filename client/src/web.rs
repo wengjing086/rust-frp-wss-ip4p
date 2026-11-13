@@ -665,10 +665,26 @@ async fn route(
 // 会话侧：在主循环里执行写请求
 // ---------------------------------------------------------------------------
 
+/// 一次写操作的失败性质。
+///
+/// 以前所有失败都只是回执给界面的字符串，于是「控制连接写超时」这种
+/// **会话其实已经死了**的情况也会被吞掉：界面上只显示"添加失败"，
+/// 主循环却继续跑，要等下一次心跳写失败才重连。分开两类后，致命错误
+/// 会经 `?` 冒泡出 `run_session`，立刻触发重连。
+enum LiveError {
+    /// 可预期的业务失败（同名、被服务端拒绝、等回应超时撤回）。界面如实显示即可。
+    Business(String),
+    /// 控制连接本身坏了（写超时 / 读错 / 对端关闭）。必须终止会话。
+    Fatal(anyhow::Error),
+}
+
 /// 执行一条来自 Web 界面的写请求。
 ///
 /// 由会话主循环调用 —— 它此刻**独占着控制连接**，所以能安全地发消息、
 /// 并在等回应的同时处理 `ReqWorkConn`。
+///
+/// 返回 `Err` 只表示「控制连接已死，请终止会话重连」；业务失败照样走回执、
+/// 返回 `Ok(())`，不会打断当前会话。
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_request(
     req: Request,
@@ -679,15 +695,29 @@ pub async fn handle_request(
     store: &Store,
     health: &Arc<health::Monitor>,
     cfg: &ClientConfig,
-) {
-    match req {
-        Request::AddProxy { proxy, reply } => {
-            let r = add_live(conn, link, run_id, proxies, store, health, cfg, *proxy).await;
-            let _ = reply.send(r);
+) -> anyhow::Result<()> {
+    let (reply, r) = match req {
+        Request::AddProxy { proxy, reply } => (
+            reply,
+            add_live(conn, link, run_id, proxies, store, health, cfg, *proxy).await,
+        ),
+        Request::RemoveProxy { name, reply } => (
+            reply,
+            remove_live(conn, proxies, store, cfg, &name).await,
+        ),
+    };
+    match r {
+        Ok(msg) => {
+            let _ = reply.send(Ok(msg));
+            Ok(())
         }
-        Request::RemoveProxy { name, reply } => {
-            let r = remove_live(conn, proxies, store, cfg, &name).await;
-            let _ = reply.send(r);
+        Err(LiveError::Business(e)) => {
+            let _ = reply.send(Err(e));
+            Ok(())
+        }
+        Err(LiveError::Fatal(e)) => {
+            let _ = reply.send(Err(format!("控制连接已断开，将自动重连：{e:#}")));
+            Err(e)
         }
     }
 }
@@ -702,9 +732,9 @@ async fn add_live(
     health: &Arc<health::Monitor>,
     cfg: &ClientConfig,
     p: ProxyConfig,
-) -> Result<String, String> {
+) -> Result<String, LiveError> {
     if proxies.get(&p.name).is_some() {
-        return Err(format!("已存在同名代理 [{}]", p.name));
+        return Err(LiveError::Business(format!("已存在同名代理 [{}]", p.name)));
     }
     let wire = NewProxy::from_config(&p, &cfg.user);
 
@@ -717,7 +747,7 @@ async fn add_live(
 
     if let Err(e) = conn.send_msg(&FrpMessage::NewProxy(wire)).await {
         proxies.remove(&p.name);
-        return Err(format!("向服务端发送 NewProxy 失败：{e:#}"));
+        return Err(LiveError::Fatal(e));
     }
 
     let deadline = Instant::now() + REGISTER_TIMEOUT;
@@ -725,26 +755,26 @@ async fn add_live(
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             proxies.remove(&p.name);
-            return Err(format!(
+            return Err(LiveError::Business(format!(
                 "{} 秒内没等到服务端的回应（已撤回本地改动）",
                 REGISTER_TIMEOUT.as_secs()
-            ));
+            )));
         }
         let msg = match tokio::time::timeout(left, conn.recv_msg()).await {
             Err(_) => {
                 proxies.remove(&p.name);
-                return Err(format!(
+                return Err(LiveError::Business(format!(
                     "{} 秒内没等到服务端的回应（已撤回本地改动）",
                     REGISTER_TIMEOUT.as_secs()
-                ));
+                )));
             }
             Ok(Err(e)) => {
                 proxies.remove(&p.name);
-                return Err(format!("控制连接出错：{e:#}"));
+                return Err(LiveError::Fatal(e));
             }
             Ok(Ok(None)) => {
                 proxies.remove(&p.name);
-                return Err("服务端关闭了控制连接".to_string());
+                return Err(LiveError::Fatal(anyhow::anyhow!("服务端关闭了控制连接")));
             }
             Ok(Ok(Some(m))) => m,
         };
@@ -753,7 +783,7 @@ async fn add_live(
             FrpMessage::NewProxyResp(r) => {
                 if !r.error.is_empty() {
                     proxies.remove(&p.name);
-                    return Err(format!("服务端拒绝：{}", r.error));
+                    return Err(LiveError::Business(format!("服务端拒绝：{}", r.error)));
                 }
                 // 落盘：重启后它还认得回来（没配 `[store] path` 时是空操作）
                 if let Err(e) = store.put(&p) {
@@ -789,9 +819,9 @@ async fn remove_live(
     store: &Store,
     cfg: &ClientConfig,
     name: &str,
-) -> Result<String, String> {
+) -> Result<String, LiveError> {
     let Some(p) = proxies.remove(name) else {
-        return Err(format!("本地没有代理 [{name}]"));
+        return Err(LiveError::Business(format!("本地没有代理 [{name}]")));
     };
     // 通知服务端把端口 / 域名收回去。用的是**线上全名**（带 `{user}.` 前缀）。
     let wire_name = util::add_user_prefix(&cfg.user, name);
@@ -801,8 +831,10 @@ async fn remove_live(
         }))
         .await
     {
-        // 本地已经摘掉了，服务端那边最多多留一会儿；下次心跳复核也会清掉
+        // 本地已经摘掉了，服务端那边最多多留一会儿；重连后的 ResumeCommit
+        // 对账会把它回收。但写失败意味着控制连接已死，必须让会话退出重连。
         warn!(proxy = %name, error = %e, "通知服务端关闭代理失败（本地已移除）");
+        return Err(LiveError::Fatal(e));
     }
     if let Err(e) = store.remove(name) {
         warn!(proxy = %name, error = %e, "从 store 删除失败（内存里已移除）");

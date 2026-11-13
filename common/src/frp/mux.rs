@@ -38,12 +38,33 @@ fn mux_config() -> Config {
 /// 服务端：接收对端打开的 yamux stream。
 pub struct MuxAcceptor {
     rx: mpsc::Receiver<BoxStream>,
+    /// 主动关闭句柄（v0.8.9）：drop 时触发，让后台驱动任务**立刻**退出。
+    ///
+    /// 官方 frp v0.72.0 修的是「被替换/失败的控制连接要立即关闭复用会话，
+    /// 释放其 streams 与工作连接」。本项目的工作连接本来就随
+    /// `ClientGuard::drop` 立即释放，但 yamux **会话对象**原先只能等
+    /// [`SESSION_IDLE_TIMEOUT`]（30s）看门狗。有了这个句柄，accept 循环
+    /// 一结束（正常结束 / 出错 / 被踢），会话与底层 TCP 立刻释放。
+    close_tx: Option<oneshot::Sender<()>>,
 }
 
 impl MuxAcceptor {
     /// 等待下一条 stream；会话关闭时返回 `None`。
     pub async fn accept(&mut self) -> Option<BoxStream> {
         self.rx.recv().await
+    }
+
+    /// 立刻关闭会话，不等空闲看门狗。没显式调用也会在 drop 时自动关闭。
+    pub fn close(&mut self) {
+        if let Some(tx) = self.close_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for MuxAcceptor {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -233,6 +254,9 @@ fn serve_with_timeouts(
     // "已创建但未认证"的流数量 ≈ 闸门上限 + 会话数 × ~9，与攻击流多少无关。
     // 正常会话 accept 是毫秒级，容量 8 对合法客户端无任何可感知影响。
     let (tx, rx) = mpsc::channel::<BoxStream>(8);
+    // 主动关闭通道：发送端随 MuxAcceptor 一起存活，接收端在驱动任务里。
+    // 发送端被 drop 或显式 send 都会让下面 select! 的这一支立刻就绪。
+    let (close_tx, mut close_rx) = oneshot::channel::<()>();
     let state = Arc::new(SessionState {
         active: AtomicUsize::new(0),
         last_open: Mutex::new(tokio::time::Instant::now()),
@@ -249,6 +273,9 @@ fn serve_with_timeouts(
             let tick = tokio::time::sleep(idle_tick);
             tokio::pin!(tick);
             let item = tokio::select! {
+                // 主动关闭优先于一切：控制连接失败 / 被踢 / accept 循环结束
+                // 时不必再等空闲看门狗（官方 v0.72.0 的语义）。
+                _ = &mut close_rx => break,
                 item = poll_fn(|cx| conn.poll_next_inbound(cx)) => item,
                 _ = &mut tick => {
                     // 保活看门狗（限制①批次2）：静默超过判定线 = 会话已死。
@@ -304,7 +331,10 @@ fn serve_with_timeouts(
             }
         }
     });
-    MuxAcceptor { rx }
+    MuxAcceptor {
+        rx,
+        close_tx: Some(close_tx),
+    }
 }
 
 /// 客户端：在一条底层流上按需开新的 yamux stream。
@@ -599,5 +629,58 @@ mod tests {
         );
         let r = tokio::time::timeout(Duration::from_millis(300), acc.accept()).await;
         assert!(r.is_err(), "保活关闭后，静默会话在短窗口内不得被关");
+    }
+
+    /// ★ v0.8.9：显式 `close()` 必须**立刻**结束会话，而不是等 30s 空闲看门狗。
+    /// 测试里把空闲线设成 3600s、也不开保活 —— 若关闭不是来自主动句柄，
+    /// 下面 500ms 的 accept 必然超时。
+    #[tokio::test]
+    async fn 主动关闭句柄立刻结束会话() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (srv, cli) = tokio::io::duplex(64 * 1024);
+        let mut acc = serve_with_timeouts(
+            Box::pin(srv),
+            Duration::from_millis(10),
+            Duration::from_secs(3600), // 彻底关掉空闲看门狗
+            None,                     // 也不开保活
+        );
+        // 先让会话真的建起来，避免测到的只是「什么都没发生」
+        let session = MuxSession::new(Box::pin(cli), None);
+        let mut held = session.open_stream().await.expect("开流");
+        held.write_all(b"x").await.expect("触发 SYN");
+        let got = acc.accept().await.expect("服务端应收到流");
+
+        acc.close();
+        let r = tokio::time::timeout(Duration::from_millis(500), acc.accept()).await;
+        assert!(
+            matches!(r, Ok(None)),
+            "主动关闭后 accept 应立刻返回 None（其余情况都说明还在等看门狗）"
+        );
+        drop((got, held, session));
+    }
+
+    /// ★ v0.8.9：`MuxAcceptor` 被 drop（accept 循环结束）时也要立刻放掉
+    /// 底层 TCP —— 用对端读到 EOF 来证明，而不是只看内部状态。
+    #[tokio::test]
+    async fn acceptor_drop_立刻释放底层连接() {
+        let (srv, mut cli) = tokio::io::duplex(4096);
+        let acc = serve_with_timeouts(
+            Box::pin(srv),
+            Duration::from_millis(10),
+            Duration::from_secs(3600),
+            None,
+        );
+        drop(acc);
+        let mut buf = [0u8; 1];
+        let r = tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::io::AsyncReadExt::read(&mut cli, &mut buf),
+        )
+        .await;
+        assert!(
+            matches!(r, Ok(Ok(0))),
+            "acceptor drop 后对端应立刻读到 EOF，实际 {r:?}"
+        );
     }
 }

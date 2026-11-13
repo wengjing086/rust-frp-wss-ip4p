@@ -16,6 +16,8 @@
 //! 走 v2，否则把这 8 字节**回填**当 v1 的消息前缀 —— 所以同一个端口能同时
 //! 服务两套协议的客户端，不需要任何配置。
 
+use std::time::Duration;
+
 use super::stream::BoxStream;
 use anyhow::{anyhow, bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,6 +45,18 @@ const MAX_BUFFER: usize = 8 * 1024 * 1024;
 /// 正常运行时它几乎是空的（上层每条消息都会取走）。真堆到这个量级
 /// 只可能是对端在灌数据 ⇒ 断开。
 const MAX_PLAIN: usize = 8 * 1024 * 1024;
+
+/// 控制消息写入超时（v0.8.9）。
+///
+/// WSS / CDN 链路上若对端不读，底层 `poll_write` 会一直返回 `Pending`：
+/// 没有上界的话 `send_msg` 会**永久**占住会话主循环 —— 心跳发不出去、
+/// 重连被无限推迟。这与官方 frp v0.72.0 修的「WebSocket 写阻塞导致
+/// session close 挂起、拖延重连」是同款症状，只是病因在写超时而非 Go yamux。
+///
+/// 控制消息都是小包（心跳 / 注册 / 回执），10 秒足够；超时即判定连接已死，
+/// 由调用方 `?` 冒泡触发重连。`write_frame` 也走 `write_bytes`，所以一处
+/// 包住就覆盖了全部写路径（含 NLink 扩展帧与 v2 握手帧）。
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 服务端在**登录阶段**明确拒绝本次连接（令牌错、用户被禁用、协议不兼容…）。
 ///
@@ -491,8 +505,18 @@ impl FrpConn {
     /// 直接 drop 会让 yamux 流以 RST 收场，对端只能看到 `connection reset`，
     /// 读不到我们刚写进去的 error 文本。
     pub async fn shutdown(&mut self) -> Result<()> {
-        self.stream.flush().await.ok();
-        self.stream.shutdown().await.ok();
+        self.shutdown_within(WRITE_TIMEOUT).await
+    }
+
+    /// [`FrpConn::shutdown`] 的时限可指定版本（测试用短超时，生产走 10s）。
+    async fn shutdown_within(&mut self, limit: Duration) -> Result<()> {
+        // 超时即放弃：对端既然不读，再等也读不到刚写进去的 error 文本，
+        // 但绝不能把调用方挂在这里（服务端拒绝路径也必须能及时返回）。
+        let _ = tokio::time::timeout(limit, async {
+            self.stream.flush().await.ok();
+            self.stream.shutdown().await.ok();
+        })
+        .await;
         Ok(())
     }
 
@@ -610,7 +634,27 @@ impl FrpConn {
     }
 
     /// 把一段**明文**写出去（内部按当前加密状态处理）。
+    ///
+    /// 整段写入（含 flush）受 [`WRITE_TIMEOUT`] 约束。超时后本条连接必定被
+    /// 上层丢弃重连，所以不必担心 `write_all` 被取消时的部分写入 —— 对端
+    /// 看到的只是一个断开的连接，不会把半帧当成有效消息。
     async fn write_bytes(&mut self, data: &[u8]) -> Result<()> {
+        self.write_bytes_within(data, WRITE_TIMEOUT).await
+    }
+
+    /// [`FrpConn::write_bytes`] 的时限可指定版本（测试用短超时，生产走 10s）。
+    async fn write_bytes_within(&mut self, data: &[u8], limit: Duration) -> Result<()> {
+        match tokio::time::timeout(limit, self.write_bytes_inner(data)).await {
+            Ok(r) => r,
+            Err(_) => bail!(
+                "控制消息写入 {:?} 未完成（对端不读？），判定连接已死并重连",
+                limit
+            ),
+        }
+    }
+
+    /// 无超时的实际写入；只由 [`FrpConn::write_bytes`] 调用。
+    async fn write_bytes_inner(&mut self, data: &[u8]) -> Result<()> {
         match &mut self.crypto {
             ControlCrypto::None => self.stream.write_all(data).await?,
             ControlCrypto::V1(c) => {
@@ -1477,10 +1521,77 @@ mod tests {
     use super::*;
     use crate::frp::msg::{FrpMessage, LoginResp, Ping};
     use crate::frp::v1;
-    use tokio::io::AsyncReadExt;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
     const TOKEN: &str = "tok";
     const RUN_ID: &str = "run-1";
+
+    /// `poll_write` / `poll_flush` 永远 Pending：模拟 WSS / CDN 反压下
+    /// 对端不读、底层写不出去的场景（官方 frp v0.72.0 修的同款症状）。
+    struct StuckWrite;
+
+    impl AsyncRead for StuckWrite {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for StuckWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// ★ v0.8.9 回归：写永久 Pending 时控制消息必须**在超时后返回错误**，
+    /// 否则 `send_msg` 会占住会话主循环，心跳发不出去、重连被无限推迟。
+    #[tokio::test]
+    async fn 写永久阻塞时控制消息按超时报错() {
+        let mut conn = FrpConn::new(Box::pin(StuckWrite), WireVersion::V1);
+        let started = tokio::time::Instant::now();
+        let r = conn
+            .write_bytes_within(b"hello", Duration::from_millis(60))
+            .await;
+        let err = r.expect_err("写永久 Pending 必须超时报错，否则会话会被挂死");
+        assert!(err.to_string().contains("判定连接已死"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "不应真的等生产环境的 10 秒超时"
+        );
+    }
+
+    /// ★ v0.8.9 回归：服务端「回一条错误再断开」的优雅关闭路径也不能被
+    /// 写阻塞挂住 —— 否则拒绝一个 visitor 就要卡 10 秒甚至更久。
+    #[tokio::test]
+    async fn 优雅关闭不会被写阻塞挂住() {
+        let mut conn = FrpConn::new(Box::pin(StuckWrite), WireVersion::V1);
+        let started = tokio::time::Instant::now();
+        conn.shutdown_within(Duration::from_millis(60))
+            .await
+            .expect("shutdown 恒返回 Ok");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "flush 永久 Pending 时 shutdown 必须按时放弃"
+        );
+    }
 
     #[test]
     fn v2_帧解析_拒绝非法_flags_和超长负载() {
