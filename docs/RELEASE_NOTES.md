@@ -1,3 +1,59 @@
+## v0.9.0 — 同步上游 0.7.7：quinn 安全升级 + SSH 网关 token 修复
+
+**线协议没变，0.8.9 / 0.9.0 可以混用。本次不部署线上 frps。**
+
+上游 `Nu0vo1212/Rust-Frp` 从 0.7.6 更新到 0.7.7，本项目逐条对照后只同步
+**适用的两项**；版本基线仍独立（本项目 0.9.0，线协议仍对齐官方 frp 0.71.0）。
+
+### 1. quinn 依赖升级（安全）
+
+上游 v0.7.7 升级 quinn 修复 3 个 RUSTSEC 公告，本项目锁定版本同样受影响：
+
+- `quinn-proto` 0.11.18 → **0.11.19**
+- `quinn-udp` 0.5.15 → **0.5.16**
+
+只动 `Cargo.lock`，`Cargo.toml` 里 `quinn = "0.11"` 的约束不变，公开 API 无变化。
+quinn 用于 QUIC 打洞 / `quicBindPort`；stcp 中继路径运行期不碰它，但依赖会编进
+二进制。上游注明这次升级修复了 3 个已公开 RUSTSEC 公告（本机未安装
+`cargo audit`，未做独立复核，仅按上游公告与锁定版本同步）。
+
+### 2. SSH 网关 `--token` 认证「永远失败」修复
+
+`[sshTunnelGateway]` 的 `--token` 是用户在 SSH 命令行输入的**原始 token**，
+而此前 `server/src/ssh_gateway.rs` 直接调用了 `verify_login` —— 后者期望的是
+`auth_key(token, ts)` 派生值，两者不是同一个量，于是**任何正确 token 都被拒**
+（报 `token in login doesn't match token from configuration`）。这个缺陷从基座
+v0.7.6 一直带着，因没有数据面 e2e 覆盖而未暴露。
+
+- `common/src/security.rs`：新增 `AuthProvider::verify_raw_token`，Token 模式做
+  常量时间原始值比较；OIDC 模式明确拒绝 `--token` 并提示改用公钥认证；
+- `server/src/guard.rs`：加对应转发方法；
+- `server/src/ssh_gateway.rs`：改调 `verify_raw_token`；
+- 补两条回归测试，锁住「原始 token 必须过、派生值必须不过」以及边界行为。
+
+### 上游另一项修复不需要同步
+
+上游 0.7.7 还修了「OIDC 模式下所有工作连接被拒」（工作连接固定发派生值，
+OIDC 分支却要解析 JWT）。本项目**此前已独立实现同一修法**：
+`Credential::wire_value(ts)`（token 发派生值、OIDC 发原始 JWT）+ `token_source`
+每条连接现取凭证，故无需改动。
+
+### 附带修复
+
+- 0.8.9 的回归测试 `acceptor_drop_立刻释放底层连接` 偶发失败：`drop(acc)` 只发
+  关闭信号，后台任务尚未被调度就断言 EOF。改为短超时重试循环（上限 2 秒），
+  不再把调度延迟误判成缺陷。
+- `scripts/build_all.sh`：本机 `~/.cargo/config.toml` 写死了失效的本地代理，
+  升级依赖后下载 crate 会卡在 `127.0.0.1`。脚本统一用
+  `--config 'http.proxy=""'` 覆盖（直连 crates.io 实测可用）。
+
+### 验证
+
+`cargo test --workspace` 全绿：1060 passed / 0 failed（新增 2 条 SSH token 测试）。
+六平台产物正常构建，Windows ARM64 仍因缺 clang 跳过。
+
+---
+
 ## v0.8.9 — 对齐官方 0.71.1/0.72.0 中的重连类修复
 
 **线协议没变，0.8.8 / 0.8.9 可以混用。**

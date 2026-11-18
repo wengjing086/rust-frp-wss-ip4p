@@ -24,8 +24,9 @@
 //! # 认证
 //!
 //! * `authorizedKeysFile` 为空 ⇒ 不校验 SSH 公钥；此时官方要求虚拟客户端
-//!   再用 `--token` 过 frps 的 token 认证，这里同样执行一次
-//!   [`crate::guard::SecurityContext::verify_login`]。
+//!   再用 `--token` 过 frps 的 token 认证，这里走
+//!   [`crate::guard::SecurityContext::verify_raw_token`] —— `--token` 是原始
+//!   token，不是登录报文里的 `auth_key(token, ts)` 派生值，二者不可混用。
 //! * 非空 ⇒ 只接受文件里的公钥；**公钥注释就是 frp 用户名**（官方语义）。
 //!
 //! SSH 层只做“是不是我们的钥匙”，RBAC / ACL / 端口白名单在注册代理时仍走
@@ -394,9 +395,14 @@ async fn run_tunnel(
     if require_token || !cmd.token.trim().is_empty() {
         // 公钥认证通过时官方不再验 token；只有 authorized_keys 为空才强制。
         // 但用户显式给了 --token 也校验一次，避免“token 写错却静默通过”。
-        let ts = util::now_unix_secs() as i64;
+        //
+        // ★ v0.9.0 修复（移植自上游 0.7.7）：这里必须用 `verify_raw_token`。
+        //   `--token` 是**原始 token**，而 `verify_login` 期望的是
+        //   `auth_key(token, ts)` 派生值 —— 此前直接调 `verify_login` 导致
+        //   token 认证**永远失败**（报 "token in login doesn't match token
+        //   from configuration"），即使用户输对了也连不上。
         security
-            .verify_login(&cmd.token, ts, &run_id)
+            .verify_raw_token(&cmd.token)
             .map_err(|e| anyhow!("SSH 网关 token 认证失败：{e}"))?;
     }
 

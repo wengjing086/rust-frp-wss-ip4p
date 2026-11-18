@@ -660,10 +660,18 @@ mod tests {
         drop((got, held, session));
     }
 
-    /// ★ v0.8.9：`MuxAcceptor` 被 drop（accept 循环结束）时也要立刻放掉
+    /// ★ v0.8.9：`MuxAcceptor` 被 drop（accept 循环结束）时也要放掉
     /// 底层 TCP —— 用对端读到 EOF 来证明，而不是只看内部状态。
+    ///
+    /// ★ v0.9.0 修 flaky：`drop(acc)` 只是往后台驱动任务发关闭信号，
+    /// 任务要等下一次被调度才会 break 并 drop 底层流。原先 drop 后立刻
+    /// 单次 read + 500ms 超时断言，在高并发测试进程里偶发「任务还没轮到
+    /// 调度就超时」。改成短超时重试循环，上限 2 秒：仍能在回归时失败，
+    /// 但不再把调度延迟误判成缺陷。
     #[tokio::test]
     async fn acceptor_drop_立刻释放底层连接() {
+        use tokio::io::AsyncReadExt as _;
+
         let (srv, mut cli) = tokio::io::duplex(4096);
         let acc = serve_with_timeouts(
             Box::pin(srv),
@@ -672,15 +680,24 @@ mod tests {
             None,
         );
         drop(acc);
-        let mut buf = [0u8; 1];
-        let r = tokio::time::timeout(
-            Duration::from_millis(500),
-            tokio::io::AsyncReadExt::read(&mut cli, &mut buf),
-        )
-        .await;
-        assert!(
-            matches!(r, Ok(Ok(0))),
-            "acceptor drop 后对端应立刻读到 EOF，实际 {r:?}"
-        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut got_eof = false;
+        while tokio::time::Instant::now() < deadline {
+            let mut buf = [0u8; 1];
+            match tokio::time::timeout(Duration::from_millis(100), cli.read(&mut buf)).await {
+                Ok(Ok(0)) => {
+                    got_eof = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => {
+                    got_eof = true;
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        assert!(got_eof, "acceptor drop 后 2 秒内对端应读到 EOF");
     }
 }

@@ -31,6 +31,13 @@ export PATH="$MINGW:$PATH"
 export CC_x86_64_pc_windows_gnu="$TOOLS_WIN/mingw/mingw64/bin/gcc.exe"
 export CARGO_HTTP_PROXY=""
 
+# 本机 ~/.cargo/config.toml 里写死了 http.proxy = http://127.0.0.1:18472，
+# 那个本地代理经常没在跑；CARGO_HTTP_PROXY="" 对配置文件里的 proxy 不生效
+# （空值被当成"未设置"）。必须用 --config 显式覆盖，否则升级依赖后
+# 下载 static.crates.io 会卡在 "Could not connect via 127.0.0.1"。
+# 直连 crates.io 实测可用，所以这里一律清空代理。
+CARGO=(cargo +stable-x86_64-pc-windows-gnu --config 'http.proxy=""')
+
 mkdir -p dist
 step() { echo; echo "########## $* ##########"; }
 
@@ -50,8 +57,8 @@ emit() {
 # 必须用 rust-lld：GNU ld 不会正确处理版本资源里的重定位，
 # 结果就是资源段进了二进制但 Windows 读不出来（详情见 docs/ANTIVIRUS.md）。
 step "windows amd64 (x86_64-pc-windows-gnu + rust-lld)"
-cargo +stable-x86_64-pc-windows-gnu rustc --release -p nfrp-server --bin nfrp-server -- -C linker=rust-lld
-cargo +stable-x86_64-pc-windows-gnu rustc --release -p nfrp-client --bin nfrp-client -- -C linker=rust-lld
+"${CARGO[@]}" rustc --release -p nfrp-server --bin nfrp-server -- -C linker=rust-lld
+"${CARGO[@]}" rustc --release -p nfrp-client --bin nfrp-client -- -C linker=rust-lld
 emit target/release/nfrp-server.exe frps_windows_amd64.exe
 emit target/release/nfrp-client.exe frpc_windows_amd64.exe
 
@@ -59,7 +66,7 @@ emit target/release/nfrp-client.exe frpc_windows_amd64.exe
 step "windows arm64 (aarch64-pc-windows-gnullvm) — 可选"
 export CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=rust-lld
 export CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS="-C link-self-contained=yes"
-if cargo +stable-x86_64-pc-windows-gnu build --release --target aarch64-pc-windows-gnullvm -p nfrp-server -p nfrp-client; then
+if "${CARGO[@]}" build --release --target aarch64-pc-windows-gnullvm -p nfrp-server -p nfrp-client; then
   emit target/aarch64-pc-windows-gnullvm/release/nfrp-server.exe frps_windows_arm64.exe
   emit target/aarch64-pc-windows-gnullvm/release/nfrp-client.exe frpc_windows_arm64.exe
 else
@@ -73,7 +80,7 @@ export CC_x86_64_unknown_linux_musl="$ZIGDIR\\cc_x86_64_linux_musl.bat"
 export AR_x86_64_unknown_linux_musl="$ZIGDIR\\ar_x86_64_linux_musl.bat"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$ZIGDIR\\cc_x86_64_linux_musl.bat"
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no"
-cargo +stable-x86_64-pc-windows-gnu build --release --target x86_64-unknown-linux-musl -p nfrp-server -p nfrp-client
+"${CARGO[@]}" build --release --target x86_64-unknown-linux-musl -p nfrp-server -p nfrp-client
 emit target/x86_64-unknown-linux-musl/release/nfrp-server frps_linux_amd64
 emit target/x86_64-unknown-linux-musl/release/nfrp-client frpc_linux_amd64
 
@@ -83,7 +90,7 @@ export CC_aarch64_unknown_linux_musl="$ZIGDIR\\cc_aarch64_linux_musl.bat"
 export AR_aarch64_unknown_linux_musl="$ZIGDIR\\ar_aarch64_linux_musl.bat"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$ZIGDIR\\cc_aarch64_linux_musl.bat"
 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no"
-cargo +stable-x86_64-pc-windows-gnu build --release --target aarch64-unknown-linux-musl -p nfrp-server -p nfrp-client
+"${CARGO[@]}" build --release --target aarch64-unknown-linux-musl -p nfrp-server -p nfrp-client
 emit target/aarch64-unknown-linux-musl/release/nfrp-server frps_linux_arm64
 emit target/aarch64-unknown-linux-musl/release/nfrp-client frpc_linux_arm64
 
