@@ -191,6 +191,7 @@ hot_reload = false
 # kcp_max_sessions = 4096
 
 # 心跳超时（秒），超时未收到客户端消息则断开
+# 0 = 禁用心跳超时（与官方 frp heartbeatInterval = 0 语义对齐），永不因静默踢人
 heartbeat_timeout = 90
 
 # ============================================================

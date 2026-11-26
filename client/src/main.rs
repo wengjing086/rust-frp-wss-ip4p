@@ -1984,13 +1984,20 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
                 .await?;
             }
             _ = ticker.tick() => {
-                conn.send_msg(&FrpMessage::Ping(Ping {
-                    timestamp: util::now_unix_secs() as i64,
-                    ..Default::default()
-                }))
-                .await?;
-                if last_pong.elapsed() > Duration::from_secs(cfg.heartbeat_timeout) {
-                    bail!("{} 秒未收到 Pong，判定连接已死", cfg.heartbeat_timeout);
+                // 官方语义：heartbeatInterval = 0 时完全禁用心跳 ——
+                // 不发 Ping、也不检测 Pong 超时（间隔兜底 max(1) 只是为了
+                // 让 ticker 合法，发送被这里的条件拦住）。
+                if cfg.heartbeat_interval > 0 {
+                    conn.send_msg(&FrpMessage::Ping(Ping {
+                        timestamp: util::now_unix_secs() as i64,
+                        ..Default::default()
+                    }))
+                    .await?;
+                    if cfg.heartbeat_timeout > 0
+                        && last_pong.elapsed() > Duration::from_secs(cfg.heartbeat_timeout)
+                    {
+                        bail!("{} 秒未收到 Pong，判定连接已死", cfg.heartbeat_timeout);
+                    }
                 }
             }
         }

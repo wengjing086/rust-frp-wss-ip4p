@@ -2368,7 +2368,11 @@ async fn handle_control(
                     warn!(client_id = %nfrp_common::util::LogSafe(&client_id), "客户端已被面板踢出，断开控制连接");
                     break;
                 }
-                if last_seen.elapsed() > Duration::from_secs(cfg.heartbeat_timeout) {
+                // 0 = 禁用心跳超时检测（与官方 frp `heartbeatInterval = 0`
+                // 的语义对齐）：永不因静默踢人，只依赖 TCP 断开事件回收会话。
+                if cfg.heartbeat_timeout > 0
+                    && last_seen.elapsed() > Duration::from_secs(cfg.heartbeat_timeout)
+                {
                     warn!(client_id = %nfrp_common::util::LogSafe(&client_id), "心跳超时 {}s，断开控制连接", cfg.heartbeat_timeout);
                     break;
                 }
